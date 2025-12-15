@@ -1,9 +1,9 @@
-use super::error::{ErrorAzCli, ResultAzCli};
+use super::error::{AzCliError, AzCliResult};
 use serde::de::DeserializeOwned;
 use std::process::{Command, Output};
 use std::{ffi::OsStr, io};
 
-fn run<I, S>(args: I) -> ResultAzCli<Output>
+fn run<I, S>(args: I) -> AzCliResult<Output>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -11,13 +11,13 @@ where
     match Command::new("az").args(args).output() {
         Ok(output) => Ok(output),
         Err(err) => match err.kind() {
-            io::ErrorKind::NotFound => Err(ErrorAzCli::AzNotInstalled),
-            _ => Err(ErrorAzCli::Io(err)),
+            io::ErrorKind::NotFound => Err(AzCliError::AzNotInstalled),
+            _ => Err(AzCliError::Io(err)),
         },
     }
 }
 
-fn authenticated() -> ResultAzCli<bool> {
+fn authenticated() -> AzCliResult<bool> {
     let output = run(["account", "show", "-o", "json"])?;
 
     match output.status.success() {
@@ -26,13 +26,13 @@ fn authenticated() -> ResultAzCli<bool> {
     }
 }
 
-fn az_raw<I, S>(args: I) -> ResultAzCli<Vec<u8>>
+fn az_raw<I, S>(args: I) -> AzCliResult<Vec<u8>>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
     if !authenticated()? {
-        return Err(ErrorAzCli::NotLoggedIn);
+        return Err(AzCliError::NotLoggedIn);
     }
 
     let output = run(args)?;
@@ -43,13 +43,13 @@ where
 
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
-    Err(ErrorAzCli::CommandFailure {
+    Err(AzCliError::CommandFailure {
         code: output.status.code(),
         stderr,
     })
 }
 
-pub fn az<T, I, S>(args: I) -> ResultAzCli<T>
+pub fn az<T, I, S>(args: I) -> AzCliResult<T>
 where
     T: DeserializeOwned,
     I: IntoIterator<Item = S>,

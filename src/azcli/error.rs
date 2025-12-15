@@ -1,10 +1,10 @@
 use std::io;
 use thiserror::Error;
 
-pub type ResultAzCli<T> = Result<T, ErrorAzCli>;
+pub type AzCliResult<T> = Result<T, AzCliError>;
 
 #[derive(Debug, Error)]
-pub enum ErrorAzCli {
+pub enum AzCliError {
     #[error("Azure CLI (az) executable not found. Install Azure CLI to continue.")]
     AzNotInstalled,
     #[error("Azure CLI returned that you are not logged in. Run `az login`.")]
