@@ -1,6 +1,7 @@
 use crate::cmd::{Cli, Command};
 use clap::Parser;
 
+mod azcli;
 mod cmd;
 mod context;
 mod prompt;
