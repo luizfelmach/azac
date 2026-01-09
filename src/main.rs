@@ -1,5 +1,6 @@
 mod azcli;
 mod commands;
+mod context;
 
 use clap::{Parser, Subcommand};
 use commands::{app, cfg, kv};
