@@ -39,7 +39,10 @@ enum Command {
         keyvault: bool,
     },
     /// Delete a key
-    Delete { key: String },
+    Delete {
+        #[arg(required = true)]
+        keys: Vec<String>,
+    },
     /// Export configuration data
     Export {
         #[arg(long, value_enum)]
@@ -105,7 +108,7 @@ fn main() {
             value,
             keyvault,
         } => kv::set_key(&key, &value, keyvault),
-        Command::Delete { key } => kv::delete_key(&key),
+        Command::Delete { keys } => kv::delete_keys(&keys),
         Command::Export { format } => kv::export_entries(format),
         Command::Import { file } => kv::import_entries(&file),
     }
