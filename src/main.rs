@@ -50,6 +50,10 @@ enum Command {
     },
     /// Import configuration data from a file
     Import { file: PathBuf },
+    /// Promote a plain value to a Key Vault reference
+    Promote { key: String },
+    /// Demote a Key Vault reference to a plain value
+    Demote { key: String },
 }
 
 #[derive(Subcommand)]
@@ -108,6 +112,8 @@ fn main() {
             value,
             keyvault,
         } => kv::set_key(&key, &value, keyvault),
+        Command::Promote { key } => kv::promote_key(&key),
+        Command::Demote { key } => kv::demote_key(&key),
         Command::Delete { keys } => kv::delete_keys(&keys),
         Command::Export { format } => kv::export_entries(format),
         Command::Import { file } => kv::import_entries(&file),

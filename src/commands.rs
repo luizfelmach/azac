@@ -199,7 +199,10 @@ pub mod app {
 
     use serde::Deserialize;
 
-    use crate::azcli::{error::AzCliResult, run::az};
+    use crate::azcli::{
+        error::{AzCliError, AzCliResult},
+        run::az,
+    };
     use crate::context::AppConfigurationContext;
 
     pub fn list_apps() {
@@ -494,7 +497,10 @@ pub mod kv {
     use heck::ToUpperCamelCase;
     use serde::Deserialize;
 
-    use crate::azcli::{error::AzCliResult, run::az};
+    use crate::azcli::{
+        error::{AzCliError, AzCliResult},
+        run::az,
+    };
     use crate::context::AppConfigurationContext;
 
     #[derive(Clone, Debug, ValueEnum)]
@@ -596,6 +602,24 @@ pub mod kv {
 
         let full_key = prefix_key(&ctx, key);
 
+        let existing_entry = show_entry(&ctx, &full_key).ok();
+        if let Some(entry) = existing_entry.as_ref() {
+            // If the stored value is a Key Vault reference, update the secret directly.
+            if let Some(secret_uri) = keyvault_uri_from_entry(entry) {
+                match set_secret_value(&secret_uri, value) {
+                    Ok(_) => {
+                        let label_display = ctx.label.as_deref().unwrap_or("(none)");
+                        println!(
+                            "Updated Key Vault secret for key '{}' in App Configuration '{}' (label: {}).",
+                            key, ctx.config_name, label_display
+                        );
+                    }
+                    Err(err) => eprintln!("Failed to update Key Vault secret for '{}': {err}", key),
+                }
+                return;
+            }
+        }
+
         let write_result = if use_keyvault {
             match build_keyvault_reference(&ctx, &full_key, value) {
                 Some(secret_uri) => write_keyvault_entry(&ctx, &full_key, &secret_uri),
@@ -614,6 +638,87 @@ pub mod kv {
                 );
             }
             Err(err) => eprintln!("Failed to set key: {err}"),
+        }
+    }
+
+    pub fn promote_key(key: &str) {
+        let Some(ctx) = resolve_active_context(true, true) else {
+            return;
+        };
+
+        let full_key = prefix_key(&ctx, key);
+        let entry = match show_entry(&ctx, &full_key) {
+            Ok(entry) => entry,
+            Err(err) => {
+                eprintln!("Failed to fetch key '{}': {err}", key);
+                return;
+            }
+        };
+
+        if keyvault_uri_from_entry(&entry).is_some() {
+            println!("Key '{}' is already stored as a Key Vault reference.", key);
+            return;
+        }
+
+        let Some(value) = entry.value.as_deref() else {
+            eprintln!("Key '{}' has no value to promote.", key);
+            return;
+        };
+
+        let secret_uri = match build_keyvault_reference(&ctx, &full_key, value) {
+            Some(uri) => uri,
+            None => return,
+        };
+
+        match write_keyvault_entry(&ctx, &full_key, &secret_uri) {
+            Ok(_) => {
+                let label_display = ctx.label.as_deref().unwrap_or("(none)");
+                println!(
+                    "Promoted key '{}' in App Configuration '{}' (label: {}) to Key Vault.",
+                    key, ctx.config_name, label_display
+                );
+            }
+            Err(err) => eprintln!("Failed to promote key '{}': {err}", key),
+        }
+    }
+
+    pub fn demote_key(key: &str) {
+        let Some(ctx) = resolve_active_context(true, true) else {
+            return;
+        };
+
+        let full_key = prefix_key(&ctx, key);
+        let entry = match show_entry(&ctx, &full_key) {
+            Ok(entry) => entry,
+            Err(err) => {
+                eprintln!("Failed to fetch key '{}': {err}", key);
+                return;
+            }
+        };
+
+        let Some(secret_uri) = keyvault_uri_from_entry(&entry) else {
+            println!("Key '{}' is already stored as a plain value.", key);
+            return;
+        };
+
+        let secret_value = match fetch_secret_value(&secret_uri) {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!("Failed to fetch Key Vault secret for '{}': {}", key, err);
+                return;
+            }
+        };
+
+        // Clear content type so we drop the Key Vault reference type.
+        match write_entry(&ctx, &full_key, &secret_value, Some("")) {
+            Ok(_) => {
+                let label_display = ctx.label.as_deref().unwrap_or("(none)");
+                println!(
+                    "Demoted key '{}' in App Configuration '{}' (label: {}) to a plain value. Key Vault secret was left untouched.",
+                    key, ctx.config_name, label_display
+                );
+            }
+            Err(err) => eprintln!("Failed to demote key '{}': {err}", key),
         }
     }
 
@@ -1020,6 +1125,28 @@ pub mod kv {
         Ok(secret.value)
     }
 
+    fn set_secret_value(uri: &str, value: &str) -> AzCliResult<()> {
+        let (vault_name, secret_name) = parse_secret_uri(uri).ok_or_else(|| AzCliError::CommandFailure {
+            code: None,
+            stderr: format!("Invalid Key Vault secret URI: {uri}"),
+        })?;
+
+        let _: serde_json::Value = az([
+            "keyvault",
+            "secret",
+            "set",
+            "--vault-name",
+            &vault_name,
+            "--name",
+            &secret_name,
+            "--value",
+            value,
+            "-o",
+            "json",
+        ])?;
+        Ok(())
+    }
+
     fn prefix_key(ctx: &ActiveKvContext, key: &str) -> String {
         match ctx.app_name.as_deref() {
             Some(app) => format!("{}{}{}", app, ctx.separator, key),
@@ -1168,6 +1295,28 @@ pub mod kv {
         };
 
         Some(normalized)
+    }
+
+    fn parse_secret_uri(uri: &str) -> Option<(String, String)> {
+        let without_scheme = uri.splitn(2, "://").nth(1)?;
+        let mut parts = without_scheme.split('/');
+        let host = parts.next()?.trim();
+        if host.is_empty() {
+            return None;
+        }
+
+        let first = parts.next()?;
+        if first != "secrets" {
+            return None;
+        }
+
+        let name = parts.next()?.trim();
+        if name.is_empty() {
+            return None;
+        }
+
+        let vault_name = host.split('.').next()?.to_string();
+        Some((vault_name, name.to_string()))
     }
 
     fn create_or_update_secret(vault_base: &str, secret_name: &str, value: &str) -> AzCliResult<()> {
