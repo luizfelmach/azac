@@ -518,9 +518,6 @@ pub mod kv {
         value: String,
     }
 
-    const KEYVAULT_CONTENT_TYPE: &str =
-        "application/vnd.microsoft.appconfig.keyvaultref+json";
-
     #[derive(Debug)]
     struct ActiveKvContext {
         subscription_id: String,
@@ -599,16 +596,16 @@ pub mod kv {
 
         let full_key = prefix_key(&ctx, key);
 
-        let (final_value, content_type) = if use_keyvault {
+        let write_result = if use_keyvault {
             match build_keyvault_reference(&ctx, &full_key, value) {
-                Some(payload) => (payload, Some(KEYVAULT_CONTENT_TYPE)),
+                Some(secret_uri) => write_keyvault_entry(&ctx, &full_key, &secret_uri),
                 None => return,
             }
         } else {
-            (value.to_string(), None)
+            write_entry(&ctx, &full_key, value, None)
         };
 
-        match write_entry(&ctx, &full_key, &final_value, content_type) {
+        match write_result {
             Ok(_) => {
                 let label_display = ctx.label.as_deref().unwrap_or("(none)");
                 println!(
@@ -705,9 +702,9 @@ pub mod kv {
         for entry in entries {
             let full_key = prefix_key(&ctx, &entry.key);
             let lower_type = entry.value_type.to_ascii_lowercase();
-            let (value, content_type) = match lower_type.as_str() {
+            let write_result = match lower_type.as_str() {
                 "keyvault" => match build_keyvault_reference(&ctx, &full_key, &entry.value) {
-                    Some(payload) => (payload, Some(KEYVAULT_CONTENT_TYPE)),
+                    Some(secret_uri) => write_keyvault_entry(&ctx, &full_key, &secret_uri),
                     None => {
                         eprintln!(
                             "Skipping '{}' (keyvault type) because no Key Vault is configured.",
@@ -716,10 +713,10 @@ pub mod kv {
                         continue;
                     }
                 },
-                _ => (entry.value.clone(), None),
+                _ => write_entry(&ctx, &full_key, &entry.value, None),
             };
 
-            match write_entry(&ctx, &full_key, &value, content_type) {
+            match write_result {
                 Ok(_) => imported += 1,
                 Err(err) => eprintln!("Failed to import '{}': {err}", entry.key),
             }
@@ -879,6 +876,36 @@ pub mod kv {
             args.push("--content-type".to_string());
             args.push(ct.to_string());
         }
+
+        if let Some(label) = &ctx.label {
+            args.push("--label".to_string());
+            args.push(label.clone());
+        }
+
+        az(args)
+    }
+
+    fn write_keyvault_entry(
+        ctx: &ActiveKvContext,
+        full_key: &str,
+        secret_uri: &str,
+    ) -> AzCliResult<KeyValue> {
+        let mut args = vec![
+            "appconfig".to_string(),
+            "kv".to_string(),
+            "set-keyvault".to_string(),
+            "--name".to_string(),
+            ctx.config_name.clone(),
+            "--subscription".to_string(),
+            ctx.subscription_id.clone(),
+            "--key".to_string(),
+            full_key.to_string(),
+            "--secret-identifier".to_string(),
+            secret_uri.to_string(),
+            "--yes".to_string(),
+            "-o".to_string(),
+            "json".to_string(),
+        ];
 
         if let Some(label) = &ctx.label {
             args.push("--label".to_string());
@@ -1117,12 +1144,7 @@ pub mod kv {
             return None;
         }
 
-        Some(
-            serde_json::json!({
-                "uri": secret_uri
-            })
-            .to_string(),
-        )
+        Some(secret_uri)
     }
 
     fn secret_name_from_key(full_key: &str) -> String {
