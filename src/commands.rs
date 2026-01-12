@@ -186,7 +186,7 @@ pub mod app {
     use std::collections::{BTreeMap, BTreeSet};
     use std::time::Duration;
 
-    use dialoguer::{theme::ColorfulTheme, Select};
+    use dialoguer::{theme::ColorfulTheme, Input, Select};
     use indicatif::ProgressBar;
     use owo_colors::OwoColorize;
     use serde::Deserialize;
@@ -251,40 +251,45 @@ pub mod app {
             }
         }
 
-        if apps.is_empty() {
-            println!(
-                "No applications inferred from keys in '{}'.",
-                config_name
-            );
-            return;
+        let creating_new_only = apps.is_empty();
+
+        if let Some(current) = current_app.as_ref() {
+            apps.entry(current.clone()).or_insert_with(BTreeSet::new);
         }
 
         let app_names: Vec<String> = apps.keys().cloned().collect();
-        let display: Vec<String> = app_names
+        let mut display: Vec<String> = app_names
             .iter()
             .map(|name| {
+                let is_current = current_app.as_deref() == Some(name.as_str());
                 let labels = apps.get(name);
                 let label_text = match labels {
                     Some(set) if !set.is_empty() => {
                         let combined = set.iter().cloned().collect::<Vec<_>>().join(", ");
                         format!("[{}]", combined)
                     }
-                    _ => "No Labels".to_string(),
+                    _ => current_label
+                        .as_deref()
+                        .filter(|_| is_current)
+                        .map(|label| format!("[{}]", label))
+                        .unwrap_or_else(|| "- No Label".to_string()),
                 };
-                let labeled = format!("{} {}", name, label_text.dimmed());
 
-                if current_app.as_deref() == Some(name.as_str()) {
-                    format!("* {}", labeled)
-                } else {
-                    format!("  {}", labeled)
-                }
+                let label_display = format!("{}", label_text.as_str().dimmed());
+                let prefix = if is_current { "* " } else { "  " };
+                format!("{prefix}{} {}", name, label_display)
             })
             .collect();
+        display.push("+ Create new".to_string());
 
-        let default_index = current_app
+        let mut default_index = current_app
             .as_ref()
             .and_then(|current| app_names.iter().position(|name| name == current))
             .unwrap_or(0);
+
+        if creating_new_only {
+            default_index = display.len() - 1;
+        }
 
         let selection = Select::with_theme(&theme)
             .with_prompt("Select the application prefix:")
@@ -292,8 +297,31 @@ pub mod app {
             .default(default_index.min(display.len().saturating_sub(1)))
             .interact_opt();
 
-        let selected_app = match selection {
-            Ok(Some(index)) => app_names[index].clone(),
+        let (selected_app, selecting_existing) = match selection {
+            Ok(Some(index)) if index < app_names.len() => {
+                let name = app_names[index].clone();
+                (name, true)
+            }
+            Ok(Some(_)) => {
+                let input = Input::with_theme(&theme)
+                    .with_prompt("Enter the new application prefix")
+                    .validate_with(|value: &String| {
+                        if value.trim().is_empty() {
+                            Err("Application name cannot be empty")
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .interact_text();
+
+                match input {
+                    Ok(value) => (value.trim().to_string(), false),
+                    Err(err) => {
+                        eprintln!("Application creation failed: {err}");
+                        return;
+                    }
+                }
+            }
             Ok(None) => {
                 println!("Application selection aborted.");
                 return;
@@ -304,23 +332,29 @@ pub mod app {
             }
         };
 
-        let labels: Vec<String> = apps
-            .get(&selected_app)
-            .map(|set| set.iter().cloned().collect())
-            .unwrap_or_default();
+        let labels: Vec<String> = if selecting_existing {
+            apps.get(&selected_app)
+                .map(|set| set.iter().cloned().collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
-        let mut label_items = Vec::with_capacity(labels.len() + 1);
-        label_items.push("No Label".to_string());
+        let mut label_items = Vec::with_capacity(labels.len() + 2);
         label_items.extend(labels.iter().cloned());
+        label_items.push("- No Label".to_string());
+        label_items.push("+ Create new".to_string());
 
-        let label_default = if current_app.as_deref() == Some(selected_app.as_str()) {
+        let no_label_index = label_items.len().saturating_sub(2);
+        let create_new_index = label_items.len().saturating_sub(1);
+
+        let label_default = if selecting_existing && current_app.as_deref() == Some(selected_app.as_str()) {
             current_label
                 .as_ref()
                 .and_then(|saved| labels.iter().position(|label| label == saved))
-                .map(|idx| idx + 1)
-                .unwrap_or(0)
+                .unwrap_or(no_label_index)
         } else {
-            0
+            no_label_index
         };
 
         let label_prompt = Select::with_theme(&theme)
@@ -330,7 +364,27 @@ pub mod app {
             .interact_opt();
 
         let selected_label = match label_prompt {
-            Ok(Some(index)) if index == 0 => None,
+            Ok(Some(index)) if index == no_label_index => None,
+            Ok(Some(index)) if index == create_new_index => {
+                let input = Input::with_theme(&theme)
+                    .with_prompt("Enter the new label")
+                    .validate_with(|value: &String| {
+                        if value.trim().is_empty() {
+                            Err("Label cannot be empty")
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .interact_text();
+
+                match input {
+                    Ok(value) => Some(value.trim().to_string()),
+                    Err(err) => {
+                        eprintln!("Label creation failed: {err}");
+                        return;
+                    }
+                }
+            }
             Ok(Some(index)) => label_items.get(index).cloned(),
             Ok(None) => {
                 println!("Label selection aborted.");
