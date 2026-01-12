@@ -23,8 +23,31 @@ pub type ContextResult<T> = Result<T, ContextError>;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Context {
-    #[serde(flatten)]
-    pub subscriptions: BTreeMap<String, SubscriptionContext>,
+    pub active: Option<ActiveContext>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ActiveContext {
+    pub subscription: SubscriptionMetadata,
+    pub config_name: String,
+    #[serde(default = "default_separator")]
+    pub separator: String,
+    #[serde(default)]
+    pub current_app: Option<String>,
+    #[serde(default)]
+    pub apps: BTreeMap<String, AppContext>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SubscriptionMetadata {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AppContext {
+    pub label: Option<String>,
+    pub keyvault: Option<String>,
 }
 
 impl Context {
@@ -52,39 +75,6 @@ impl Context {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct SubscriptionContext {
-    pub current: Option<String>,
-    #[serde(flatten)]
-    pub configs: BTreeMap<String, AppConfigurationContext>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AppConfigurationContext {
-    #[serde(default)]
-    pub current: Option<String>,
-    #[serde(default = "default_separator")]
-    pub separator: String,
-    #[serde(default)]
-    pub apps: BTreeMap<String, AppContext>,
-}
-
-impl Default for AppConfigurationContext {
-    fn default() -> Self {
-        Self {
-            current: None,
-            separator: default_separator(),
-            apps: BTreeMap::new(),
-        }
-    }
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct AppContext {
-    pub label: Option<String>,
-    pub keyvault: Option<String>,
-}
-
 pub struct ContextStore {
     path: PathBuf,
 }
@@ -106,6 +96,6 @@ fn project_dirs() -> Option<ProjectDirs> {
     ProjectDirs::from("dev", "azac", "azac")
 }
 
-fn default_separator() -> String {
+pub fn default_separator() -> String {
     DEFAULT_SEPARATOR.to_string()
 }

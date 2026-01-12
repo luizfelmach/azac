@@ -1,197 +1,141 @@
 use crate::{
-    azcli::subscription,
-    context::{Context, ContextStore},
+    azcli::{appconfig, subscription},
+    context::{default_separator, ActiveContext, Context, ContextStore, SubscriptionMetadata},
 };
+use dialoguer::{theme::ColorfulTheme, Input, Select};
+use std::collections::BTreeMap;
 
-pub mod cfg {
-    use crate::azcli::appconfig;
-    use crate::context::AppConfigurationContext;
+pub fn setup() {
+    let theme = ColorfulTheme::default();
 
-    pub fn list_configs() {
-        let Some(subscription) = super::current_subscription() else {
-            eprintln!("Could not determine the active Azure subscription.");
+    let subscriptions = match subscription::list_subscription() {
+        Ok(list) => list,
+        Err(err) => {
+            eprintln!("Failed to list Azure subscriptions: {err}");
             return;
-        };
+        }
+    };
 
-        let (_, context) = match super::load_context() {
-            Some(value) => value,
-            None => return,
-        };
+    if subscriptions.is_empty() {
+        eprintln!("No Azure subscriptions available.");
+        return;
+    }
 
-        let current_cfg = context
-            .subscriptions
-            .get(&subscription.id)
-            .and_then(|ctx| ctx.current.as_deref())
-            .map(|value| value.to_string());
-
-        match appconfig::list_appconfig(&subscription.id) {
+    let mut options = Vec::new();
+    for sub in &subscriptions {
+        match appconfig::list_appconfig(&sub.id) {
             Ok(configs) => {
                 if configs.is_empty() {
-                    println!(
-                        "No App Configuration instances found for subscription '{}'.",
-                        subscription.name
-                    );
-                    return;
+                    continue;
                 }
-
                 for cfg in configs {
-                    let marker = if current_cfg.as_deref() == Some(cfg.name.as_str()) {
-                        "*"
-                    } else {
-                        " "
-                    };
-                    println!("[{}] {}", marker, cfg.name);
+                    options.push(ConfigOption {
+                        subscription: sub.clone(),
+                        config: cfg,
+                    });
                 }
             }
-            Err(err) => eprintln!("Failed to list App Configuration instances: {err}"),
-        }
-    }
-
-    pub fn use_config(name: &str) {
-        let Some(subscription) = super::current_subscription() else {
-            eprintln!("Could not determine the active Azure subscription.");
-            return;
-        };
-
-        let (store, mut context) = match super::load_context() {
-            Some(value) => value,
-            None => return,
-        };
-
-        let sub_ctx = context
-            .subscriptions
-            .entry(subscription.id.clone())
-            .or_default();
-        sub_ctx.current = Some(name.to_string());
-        sub_ctx
-            .configs
-            .entry(name.to_string())
-            .or_insert_with(AppConfigurationContext::default);
-
-        if super::save_context(&store, &context) {
-            println!(
-                "Using App Configuration '{}' for subscription '{}'.",
-                name, subscription.name
-            );
-        }
-    }
-
-    pub fn show_config(name: &str) {
-        let Some(subscription) = super::current_subscription() else {
-            eprintln!("Could not determine the active Azure subscription.");
-            return;
-        };
-
-        let (_, context) = match super::load_context() {
-            Some(value) => value,
-            None => return,
-        };
-
-        let Some(sub_ctx) = context.subscriptions.get(&subscription.id) else {
-            eprintln!(
-                "No stored context for subscription '{}'.",
-                subscription.name
-            );
-            return;
-        };
-
-        let Some(cfg_ctx) = sub_ctx.configs.get(name) else {
-            eprintln!(
-                "Configuration '{}' is not tracked yet. Use `azac cfg use {}` first.",
-                name, name
-            );
-            return;
-        };
-
-        println!("Subscription: {} ({})", subscription.name, subscription.id);
-        println!("App Configuration: {}", name);
-        println!("Separator: {}", cfg_ctx.separator);
-        if let Some(current_app) = &cfg_ctx.current {
-            println!("Current app: {}", current_app);
-        }
-
-        if cfg_ctx.apps.is_empty() {
-            println!("Apps: none defined");
-        } else {
-            println!("Apps:");
-            for (app_name, app_ctx) in &cfg_ctx.apps {
-                let marker = if cfg_ctx.current.as_deref() == Some(app_name.as_str()) {
-                    "*"
-                } else {
-                    " "
-                };
-                println!("  [{}] {}", marker, app_name);
-                if let Some(label) = &app_ctx.label {
-                    println!("    label: {}", label);
-                }
-                if let Some(vault) = &app_ctx.keyvault {
-                    println!("    keyvault: {}", vault);
-                }
+            Err(err) => {
+                eprintln!(
+                    "Failed to list App Configurations for subscription '{}': {}",
+                    sub.name, err
+                );
             }
         }
     }
 
-    pub fn set_separator(separator: &str) {
-        let Some(subscription) = super::current_subscription() else {
-            eprintln!("Could not determine the active Azure subscription.");
+    if options.is_empty() {
+        eprintln!("No App Configuration instances were found across your subscriptions.");
+        return;
+    }
+
+    let labels: Vec<String> = options
+        .iter()
+        .map(|option| {
+            format!(
+                "{} │ {}",
+                option.subscription.name, option.config.name
+            )
+        })
+        .collect();
+
+    let selection = Select::with_theme(&theme)
+        .with_prompt("Select the App Configuration to use")
+        .items(&labels)
+        .default(0)
+        .interact_opt();
+
+    let selected = match selection {
+        Ok(Some(index)) => &options[index],
+        Ok(None) => {
+            println!("Setup aborted.");
             return;
-        };
-
-        let (store, mut context) = match super::load_context() {
-            Some(value) => value,
-            None => return,
-        };
-
-        let Some(sub_ctx) = context.subscriptions.get_mut(&subscription.id) else {
-            eprintln!("No App Configuration selected. Use `azac cfg use <name>` first.");
+        }
+        Err(err) => {
+            eprintln!("Selection failed: {err}");
             return;
-        };
+        }
+    };
 
-        let Some(cfg_name) = sub_ctx.current.clone() else {
-            eprintln!("No App Configuration selected. Use `azac cfg use <name>` first.");
+    let default_sep = default_separator();
+    let separator_input: String = match Input::with_theme(&theme)
+        .with_prompt("Key separator")
+        .default(default_sep.clone())
+        .interact_text()
+    {
+        Ok(value) => value.trim().to_string(),
+        Err(err) => {
+            eprintln!("Separator prompt failed: {err}");
             return;
-        };
+        }
+    };
+    let separator = if separator_input.is_empty() {
+        default_sep
+    } else {
+        separator_input
+    };
 
-        let cfg_ctx = sub_ctx
-            .configs
-            .entry(cfg_name.clone())
-            .or_insert_with(AppConfigurationContext::default);
-        cfg_ctx.separator = separator.to_string();
+    let (store, mut context) = match load_context() {
+        Some(value) => value,
+        None => return,
+    };
 
-        if super::save_context(&store, &context) {
-            println!("Separator for '{}' set to '{}'.", cfg_name, separator);
+    let mut preserved_current = None;
+    let mut preserved_apps = BTreeMap::new();
+
+    if let Some(existing) = context.active.take() {
+        if existing.subscription.id == selected.subscription.id
+            && existing.config_name == selected.config.name
+        {
+            preserved_current = existing.current_app;
+            preserved_apps = existing.apps;
         }
     }
 
-    pub fn show_current_config() {
-        let Some(subscription) = super::current_subscription() else {
-            eprintln!("Could not determine the active Azure subscription.");
-            return;
-        };
+    let active = ActiveContext {
+        subscription: SubscriptionMetadata {
+            id: selected.subscription.id.clone(),
+            name: selected.subscription.name.clone(),
+        },
+        config_name: selected.config.name.clone(),
+        separator,
+        current_app: preserved_current,
+        apps: preserved_apps,
+    };
 
-        let (_, context) = match super::load_context() {
-            Some(value) => value,
-            None => return,
-        };
+    context.active = Some(active);
 
-        let Some(sub_ctx) = context.subscriptions.get(&subscription.id) else {
-            eprintln!(
-                "No App Configuration selected for subscription '{}'.",
-                subscription.name
-            );
-            return;
-        };
-
-        let Some(cfg_name) = &sub_ctx.current else {
-            eprintln!(
-                "No App Configuration selected for subscription '{}'.",
-                subscription.name
-            );
-            return;
-        };
-
-        println!("{}", cfg_name);
+    if save_context(&store, &context) {
+        println!(
+            "Using App Configuration '{}' in subscription '{}'.",
+            selected.config.name, selected.subscription.name
+        );
     }
+}
+
+struct ConfigOption {
+    subscription: subscription::Subscription,
+    config: appconfig::AppConfig,
 }
 
 pub mod app {
@@ -203,39 +147,19 @@ pub mod app {
         error::{AzCliError, AzCliResult},
         run::az,
     };
-    use crate::context::AppConfigurationContext;
 
     pub fn list_apps() {
-        let Some(subscription) = super::current_subscription() else {
-            eprintln!("Could not determine the active Azure subscription.");
-            return;
-        };
-
         let (_, context) = match super::load_context() {
             Some(value) => value,
             None => return,
         };
 
-        let Some(sub_ctx) = context.subscriptions.get(&subscription.id) else {
-            eprintln!("No App Configuration selected. Use `azac cfg use <name>` first.");
+        let Some(active) = context.active.as_ref() else {
+            super::missing_setup_message();
             return;
         };
 
-        let Some(cfg_name) = &sub_ctx.current else {
-            eprintln!("No App Configuration selected. Use `azac cfg use <name>` first.");
-            return;
-        };
-
-        let default_ctx;
-        let cfg_ctx = match sub_ctx.configs.get(cfg_name) {
-            Some(ctx) => ctx,
-            None => {
-                default_ctx = AppConfigurationContext::default();
-                &default_ctx
-            }
-        };
-
-        let entries = match fetch_all_keys(cfg_name, &subscription.id) {
+        let entries = match fetch_all_keys(&active.config_name, &active.subscription.id) {
             Ok(entries) => entries,
             Err(err) => {
                 eprintln!("Failed to list applications: {err}");
@@ -245,19 +169,22 @@ pub mod app {
 
         let mut apps = BTreeSet::new();
         for entry in entries {
-            if let Some(idx) = entry.key.rfind(&cfg_ctx.separator) {
+            if let Some(idx) = entry.key.rfind(&active.separator) {
                 let prefix = &entry.key[..idx];
                 apps.insert(prefix.to_string());
             }
         }
 
         if apps.is_empty() {
-            println!("No applications inferred from keys in '{}'.", cfg_name);
+            println!(
+                "No applications inferred from keys in '{}'.",
+                active.config_name
+            );
             return;
         }
 
         for app_name in apps {
-            let marker = if cfg_ctx.current.as_deref() == Some(app_name.as_str()) {
+            let marker = if active.current_app.as_deref() == Some(app_name.as_str()) {
                 "*"
             } else {
                 " "
@@ -267,72 +194,46 @@ pub mod app {
     }
 
     pub fn use_app(name: &str) {
-        let Some(subscription) = super::current_subscription() else {
-            eprintln!("Could not determine the active Azure subscription.");
-            return;
-        };
-
         let (store, mut context) = match super::load_context() {
             Some(value) => value,
             None => return,
         };
 
-        let Some(sub_ctx) = context.subscriptions.get_mut(&subscription.id) else {
-            eprintln!("No App Configuration selected. Use `azac cfg use <name>` first.");
+        let Some(active) = context.active.as_mut() else {
+            super::missing_setup_message();
             return;
         };
 
-        let Some(cfg_name) = sub_ctx.current.clone() else {
-            eprintln!("No App Configuration selected. Use `azac cfg use <name>` first.");
-            return;
-        };
+        active.current_app = Some(name.to_string());
+        active.apps.entry(name.to_string()).or_default();
 
-        let cfg_ctx = sub_ctx
-            .configs
-            .entry(cfg_name.clone())
-            .or_insert_with(AppConfigurationContext::default);
-        cfg_ctx.current = Some(name.to_string());
-        cfg_ctx.apps.entry(name.to_string()).or_default();
+        let config_name = active.config_name.clone();
+        drop(active);
 
         if super::save_context(&store, &context) {
             println!(
                 "Using application '{}' under App Configuration '{}'.",
-                name, cfg_name
+                name, config_name
             );
         }
     }
 
     pub fn show_app(name: &str) {
-        let Some(subscription) = super::current_subscription() else {
-            eprintln!("Could not determine the active Azure subscription.");
-            return;
-        };
-
         let (_, context) = match super::load_context() {
             Some(value) => value,
             None => return,
         };
 
-        let Some(sub_ctx) = context.subscriptions.get(&subscription.id) else {
-            eprintln!("No App Configuration selected. Use `azac cfg use <name>` first.");
+        let Some(active) = context.active.as_ref() else {
+            super::missing_setup_message();
             return;
         };
 
-        let Some(cfg_name) = &sub_ctx.current else {
-            eprintln!("No App Configuration selected. Use `azac cfg use <name>` first.");
-            return;
-        };
-
-        let Some(cfg_ctx) = sub_ctx.configs.get(cfg_name) else {
+        let Some(app_ctx) = active.apps.get(name) else {
             eprintln!(
-                "Configuration '{}' is not tracked. Use `azac cfg use {}` first.",
-                cfg_name, cfg_name
+                "Application '{}' not defined for '{}'.",
+                name, active.config_name
             );
-            return;
-        };
-
-        let Some(app_ctx) = cfg_ctx.apps.get(name) else {
-            eprintln!("Application '{}' not defined for '{}'.", name, cfg_name);
             return;
         };
 
@@ -345,38 +246,27 @@ pub mod app {
     }
 
     pub fn set_label(label: &str) {
-        let Some(subscription) = super::current_subscription() else {
-            eprintln!("Could not determine the active Azure subscription.");
-            return;
-        };
-
         let (store, mut context) = match super::load_context() {
             Some(value) => value,
             None => return,
         };
 
-        let Some(sub_ctx) = context.subscriptions.get_mut(&subscription.id) else {
-            eprintln!("No App Configuration selected. Use `azac cfg use <name>` first.");
+        let Some(active) = context.active.as_mut() else {
+            super::missing_setup_message();
             return;
         };
 
-        let Some(cfg_name) = sub_ctx.current.clone() else {
-            eprintln!("No App Configuration selected. Use `azac cfg use <name>` first.");
-            return;
-        };
-
-        let cfg_ctx = sub_ctx
-            .configs
-            .entry(cfg_name.clone())
-            .or_insert_with(AppConfigurationContext::default);
-
-        let Some(app_name) = cfg_ctx.current.clone() else {
+        let Some(app_name) = active.current_app.clone() else {
             eprintln!("No application selected. Use `azac app use <name>` first.");
             return;
         };
 
-        let app_ctx = cfg_ctx.apps.entry(app_name.clone()).or_default();
-        app_ctx.label = Some(label.to_string());
+        {
+            let app_ctx = active.apps.entry(app_name.clone()).or_default();
+            app_ctx.label = Some(label.to_string());
+        }
+
+        drop(active);
 
         if super::save_context(&store, &context) {
             println!("Set label for '{}' to '{}'.", app_name, label);
@@ -384,38 +274,27 @@ pub mod app {
     }
 
     pub fn set_keyvault(vault: &str) {
-        let Some(subscription) = super::current_subscription() else {
-            eprintln!("Could not determine the active Azure subscription.");
-            return;
-        };
-
         let (store, mut context) = match super::load_context() {
             Some(value) => value,
             None => return,
         };
 
-        let Some(sub_ctx) = context.subscriptions.get_mut(&subscription.id) else {
-            eprintln!("No App Configuration selected. Use `azac cfg use <name>` first.");
+        let Some(active) = context.active.as_mut() else {
+            super::missing_setup_message();
             return;
         };
 
-        let Some(cfg_name) = sub_ctx.current.clone() else {
-            eprintln!("No App Configuration selected. Use `azac cfg use <name>` first.");
-            return;
-        };
-
-        let cfg_ctx = sub_ctx
-            .configs
-            .entry(cfg_name.clone())
-            .or_insert_with(AppConfigurationContext::default);
-
-        let Some(app_name) = cfg_ctx.current.clone() else {
+        let Some(app_name) = active.current_app.clone() else {
             eprintln!("No application selected. Use `azac app use <name>` first.");
             return;
         };
 
-        let app_ctx = cfg_ctx.apps.entry(app_name.clone()).or_default();
-        app_ctx.keyvault = Some(vault.to_string());
+        {
+            let app_ctx = active.apps.entry(app_name.clone()).or_default();
+            app_ctx.keyvault = Some(vault.to_string());
+        }
+
+        drop(active);
 
         if super::save_context(&store, &context) {
             println!("Set Key Vault for '{}' to '{}'.", app_name, vault);
@@ -423,40 +302,22 @@ pub mod app {
     }
 
     pub fn show_current_app() {
-        let Some(subscription) = super::current_subscription() else {
-            eprintln!("Could not determine the active Azure subscription.");
-            return;
-        };
-
         let (_, context) = match super::load_context() {
             Some(value) => value,
             None => return,
         };
 
-        let Some(sub_ctx) = context.subscriptions.get(&subscription.id) else {
-            eprintln!("No App Configuration selected. Use `azac cfg use <name>` first.");
+        let Some(active) = context.active.as_ref() else {
+            super::missing_setup_message();
             return;
         };
 
-        let Some(cfg_name) = &sub_ctx.current else {
-            eprintln!("No App Configuration selected. Use `azac cfg use <name>` first.");
+        let Some(app_name) = &active.current_app else {
+            eprintln!("No application selected for '{}'.", active.config_name);
             return;
         };
 
-        let Some(cfg_ctx) = sub_ctx.configs.get(cfg_name) else {
-            eprintln!(
-                "Configuration '{}' is not tracked. Use `azac cfg use {}` first.",
-                cfg_name, cfg_name
-            );
-            return;
-        };
-
-        let Some(app_name) = &cfg_ctx.current else {
-            eprintln!("No application selected for '{}'.", cfg_name);
-            return;
-        };
-
-        let app_ctx = cfg_ctx.apps.get(app_name);
+        let app_ctx = active.apps.get(app_name);
         let label = app_ctx
             .and_then(|ctx| ctx.label.as_deref())
             .unwrap_or("(none)");
@@ -514,7 +375,6 @@ pub mod kv {
         error::{AzCliError, AzCliResult},
         run::az,
     };
-    use crate::context::AppConfigurationContext;
 
     #[derive(Clone, Copy, Debug, ValueEnum)]
     pub enum ExportFormat {
@@ -1088,55 +948,26 @@ pub mod kv {
     }
 
     fn resolve_active_context(require_app: bool, require_label: bool) -> Option<ActiveKvContext> {
-        let subscription = match super::current_subscription() {
-            Some(sub) => sub,
-            None => return None,
-        };
-
         let (_, context) = match super::load_context() {
             Some(value) => value,
             None => return None,
         };
 
-        let sub_ctx = match context.subscriptions.get(&subscription.id) {
-            Some(ctx) => ctx,
-            None => {
-                eprintln!(
-                    "No stored context for subscription '{}'. Use `azac cfg use <name>` first.",
-                    subscription.name
-                );
-                return None;
-            }
+        let Some(active) = context.active.as_ref() else {
+            super::missing_setup_message();
+            return None;
         };
 
-        let config_name = match sub_ctx.current.as_ref() {
-            Some(name) => name.clone(),
-            None => {
-                eprintln!(
-                    "No App Configuration selected for subscription '{}'. Use `azac cfg use <name>`.",
-                    subscription.name
-                );
-                return None;
-            }
-        };
-
-        let default_ctx;
-        let cfg_ctx = match sub_ctx.configs.get(&config_name) {
-            Some(ctx) => ctx,
-            None => {
-                default_ctx = AppConfigurationContext::default();
-                &default_ctx
-            }
-        };
-
-        let app_name = cfg_ctx.current.clone();
+        let app_name = active.current_app.clone();
 
         if require_app && app_name.is_none() {
             eprintln!("No application selected. Use `azac app use <name>` first.");
             return None;
         }
 
-        let app_ctx = app_name.as_ref().and_then(|name| cfg_ctx.apps.get(name));
+        let app_ctx = app_name
+            .as_ref()
+            .and_then(|name| active.apps.get(name));
 
         let label = app_ctx
             .and_then(|ctx| ctx.label.clone())
@@ -1151,9 +982,9 @@ pub mod kv {
             .filter(|kv| !kv.is_empty());
 
         Some(ActiveKvContext {
-            subscription_id: subscription.id,
-            config_name,
-            separator: cfg_ctx.separator.clone(),
+            subscription_id: active.subscription.id.clone(),
+            config_name: active.config_name.clone(),
+            separator: active.separator.clone(),
             app_name,
             label,
             keyvault,
@@ -1934,29 +1765,6 @@ fn save_context(store: &ContextStore, context: &Context) -> bool {
     }
 }
 
-fn current_subscription() -> Option<subscription::Subscription> {
-    match subscription::list_subscription() {
-        Ok(subscriptions) => {
-            if subscriptions.is_empty() {
-                eprintln!("No Azure subscriptions are available.");
-                return None;
-            }
-
-            let default = subscriptions
-                .iter()
-                .find(|sub| sub.is_default)
-                .cloned()
-                .or_else(|| subscriptions.first().cloned());
-
-            if default.is_none() {
-                eprintln!("Could not find an active Azure subscription.");
-            }
-
-            default
-        }
-        Err(err) => {
-            eprintln!("Failed to list Azure subscriptions: {err}");
-            None
-        }
-    }
+fn missing_setup_message() {
+    eprintln!("No App Configuration context configured. Run `azac setup` first.");
 }

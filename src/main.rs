@@ -3,7 +3,7 @@ mod commands;
 mod context;
 
 use clap::{Parser, Subcommand};
-use commands::{app, cfg, kv};
+use commands::{app, kv};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -21,9 +21,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Manage App Configuration instances
-    #[command(subcommand)]
-    Cfg(CfgCommand),
+    /// Configure the active App Configuration context
+    Setup,
     /// Manage applications under the current App Configuration
     #[command(subcommand)]
     App(AppCommand),
@@ -59,20 +58,6 @@ enum Command {
 }
 
 #[derive(Subcommand)]
-enum CfgCommand {
-    /// List App Configuration instances
-    List,
-    /// Set the active App Configuration
-    Use { cfg: String },
-    /// Show information about an App Configuration
-    Show { cfg: String },
-    /// Set the key separator for the current App Configuration
-    Separator { separator: String },
-    /// Display the currently selected App Configuration
-    Current,
-}
-
-#[derive(Subcommand)]
 enum AppCommand {
     /// List available applications
     List,
@@ -92,13 +77,7 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Cfg(cfg_command) => match cfg_command {
-            CfgCommand::List => cfg::list_configs(),
-            CfgCommand::Use { cfg } => cfg::use_config(&cfg),
-            CfgCommand::Show { cfg } => cfg::show_config(&cfg),
-            CfgCommand::Separator { separator } => cfg::set_separator(&separator),
-            CfgCommand::Current => cfg::show_current_config(),
-        },
+        Command::Setup => commands::setup(),
         Command::App(app_command) => match app_command {
             AppCommand::List => app::list_apps(),
             AppCommand::Use { app } => app::use_app(&app),
