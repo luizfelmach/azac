@@ -183,11 +183,12 @@ struct ConfigOption {
 }
 
 pub mod app {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::time::Duration;
 
     use dialoguer::{theme::ColorfulTheme, Select};
     use indicatif::ProgressBar;
+    use owo_colors::OwoColorize;
     use serde::Deserialize;
 
     use crate::azcli::{
@@ -203,7 +204,7 @@ pub mod app {
             None => return,
         };
 
-        let (subscription_id, config_name, separator, current_app) = {
+        let (subscription_id, config_name, separator, current_app, current_label) = {
             let Some(active) = context.active.as_ref() else {
                 super::missing_setup_message();
                 return;
@@ -214,6 +215,7 @@ pub mod app {
                 active.config_name.clone(),
                 active.separator.clone(),
                 active.app.name.clone(),
+                active.app.label.clone(),
             )
         };
 
@@ -236,11 +238,16 @@ pub mod app {
 
         spinner.finish_and_clear();
 
-        let mut apps = BTreeSet::new();
+        let mut apps: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for entry in entries {
             if let Some(idx) = entry.key.rfind(&separator) {
-                let prefix = &entry.key[..idx];
-                apps.insert(prefix.to_string());
+                let prefix = entry.key[..idx].to_string();
+                let labels = apps.entry(prefix).or_default();
+                if let Some(label) = entry.label.as_deref().map(str::trim) {
+                    if !label.is_empty() {
+                        labels.insert(label.to_string());
+                    }
+                }
             }
         }
 
@@ -252,14 +259,24 @@ pub mod app {
             return;
         }
 
-        let app_names: Vec<String> = apps.into_iter().collect();
+        let app_names: Vec<String> = apps.keys().cloned().collect();
         let display: Vec<String> = app_names
             .iter()
             .map(|name| {
+                let labels = apps.get(name);
+                let label_text = match labels {
+                    Some(set) if !set.is_empty() => {
+                        let combined = set.iter().cloned().collect::<Vec<_>>().join(", ");
+                        format!("[{}]", combined)
+                    }
+                    _ => "No Labels".to_string(),
+                };
+                let labeled = format!("{} {}", name, label_text.dimmed());
+
                 if current_app.as_deref() == Some(name.as_str()) {
-                    format!("* {}", name)
+                    format!("* {}", labeled)
                 } else {
-                    format!("  {}", name)
+                    format!("  {}", labeled)
                 }
             })
             .collect();
@@ -275,7 +292,7 @@ pub mod app {
             .default(default_index.min(display.len().saturating_sub(1)))
             .interact_opt();
 
-        let selected = match selection {
+        let selected_app = match selection {
             Ok(Some(index)) => app_names[index].clone(),
             Ok(None) => {
                 println!("Application selection aborted.");
@@ -287,22 +304,61 @@ pub mod app {
             }
         };
 
+        let labels: Vec<String> = apps
+            .get(&selected_app)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+
+        let mut label_items = Vec::with_capacity(labels.len() + 1);
+        label_items.push("No Label".to_string());
+        label_items.extend(labels.iter().cloned());
+
+        let label_default = if current_app.as_deref() == Some(selected_app.as_str()) {
+            current_label
+                .as_ref()
+                .and_then(|saved| labels.iter().position(|label| label == saved))
+                .map(|idx| idx + 1)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        let label_prompt = Select::with_theme(&theme)
+            .with_prompt("Select the label for this application:")
+            .items(&label_items)
+            .default(label_default.min(label_items.len().saturating_sub(1)))
+            .interact_opt();
+
+        let selected_label = match label_prompt {
+            Ok(Some(index)) if index == 0 => None,
+            Ok(Some(index)) => label_items.get(index).cloned(),
+            Ok(None) => {
+                println!("Label selection aborted.");
+                return;
+            }
+            Err(err) => {
+                eprintln!("Label selection failed: {err}");
+                return;
+            }
+        };
+
         let config_name = {
             let Some(active) = context.active.as_mut() else {
                 super::missing_setup_message();
                 return;
             };
 
-            active.app.name = Some(selected.clone());
-            active.app.label = None;
+            active.app.name = Some(selected_app.clone());
+            active.app.label = selected_label.clone();
             active.app.keyvault = None;
             active.config_name.clone()
         };
 
         if super::save_context(&store, &context) {
+            let label_display = selected_label.as_deref().unwrap_or("(none)");
             println!(
-                "Using application '{}' under App Configuration '{}'.",
-                selected, config_name
+                "Using application '{}' (label: {}) under App Configuration '{}'.",
+                selected_app, label_display, config_name
             );
         }
     }
@@ -310,6 +366,7 @@ pub mod app {
     #[derive(Debug, Deserialize)]
     struct KeyValue {
         key: String,
+        label: Option<String>,
     }
 
     fn fetch_all_keys(config_name: &str, subscription_id: &str) -> AzCliResult<Vec<KeyValue>> {
