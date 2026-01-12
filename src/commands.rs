@@ -3,18 +3,36 @@ use crate::{
     context::{default_separator, ActiveContext, Context, ContextStore, SubscriptionMetadata},
 };
 use dialoguer::{theme::ColorfulTheme, Input, Select};
-use std::collections::BTreeMap;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use std::{
+    collections::BTreeMap,
+    sync::mpsc,
+    thread,
+    time::Duration,
+};
 
 pub fn setup() {
     let theme = ColorfulTheme::default();
+    let spinner_style = standard_spinner_style();
+    let multi = MultiProgress::new();
+
+    let sub_bar = multi.add(ProgressBar::new_spinner());
+    sub_bar.set_style(spinner_style.clone());
+    sub_bar.set_message("Fetching Azure subscriptions...");
+    sub_bar.enable_steady_tick(Duration::from_millis(80));
 
     let subscriptions = match subscription::list_subscription() {
         Ok(list) => list,
         Err(err) => {
+            sub_bar.finish_with_message(format!("Failed to list subscriptions: {err}"));
             eprintln!("Failed to list Azure subscriptions: {err}");
             return;
         }
     };
+    sub_bar.finish_with_message(format!(
+        "Fetched {} Azure subscriptions.",
+        subscriptions.len()
+    ));
 
     if subscriptions.is_empty() {
         eprintln!("No Azure subscriptions available.");
@@ -22,25 +40,58 @@ pub fn setup() {
     }
 
     let mut options = Vec::new();
-    for sub in &subscriptions {
-        match appconfig::list_appconfig(&sub.id) {
-            Ok(configs) => {
-                if configs.is_empty() {
-                    continue;
+    let (tx, rx) = mpsc::channel();
+
+    thread::scope(|scope| {
+        for subscription in subscriptions.iter().cloned() {
+            let bar = multi.add(ProgressBar::new_spinner());
+            bar.set_style(spinner_style.clone());
+            let tx = tx.clone();
+
+            scope.spawn(move || {
+                bar.enable_steady_tick(Duration::from_millis(80));
+                bar.set_message(format!(
+                    "Fetching App Configurations for '{}'",
+                    subscription.name
+                ));
+
+                match appconfig::list_appconfig(&subscription.id) {
+                    Ok(configs) => {
+                        if configs.is_empty() {
+                            bar.finish_with_message(format!(
+                                "No App Configurations in subscription '{}'",
+                                subscription.name
+                            ));
+                            return;
+                        }
+
+                        let count = configs.len();
+                        bar.finish_with_message(format!(
+                            "Fetched {} App Configurations for '{}'",
+                            count, subscription.name
+                        ));
+
+                        let _ = tx.send((subscription, configs));
+                    }
+                    Err(err) => {
+                        bar.finish_with_message(format!(
+                            "Failed to list App Configurations for '{}': {}",
+                            subscription.name, err
+                        ));
+                    }
                 }
-                for cfg in configs {
-                    options.push(ConfigOption {
-                        subscription: sub.clone(),
-                        config: cfg,
-                    });
-                }
-            }
-            Err(err) => {
-                eprintln!(
-                    "Failed to list App Configurations for subscription '{}': {}",
-                    sub.name, err
-                );
-            }
+            });
+        }
+    });
+
+    drop(tx);
+
+    for (subscription, configs) in rx {
+        for cfg in configs {
+            options.push(ConfigOption {
+                subscription: subscription.clone(),
+                config: cfg,
+            });
         }
     }
 
@@ -1767,4 +1818,9 @@ fn save_context(store: &ContextStore, context: &Context) -> bool {
 
 fn missing_setup_message() {
     eprintln!("No App Configuration context configured. Run `azac setup` first.");
+}
+
+fn standard_spinner_style() -> ProgressStyle {
+    ProgressStyle::with_template("{spinner:.green} {msg}")
+        .unwrap_or_else(|_| ProgressStyle::default_spinner())
 }
