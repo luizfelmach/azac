@@ -491,9 +491,21 @@ pub mod app {
 }
 
 pub mod kv {
-    use std::{fs, path::Path};
+    use std::{
+        collections::VecDeque,
+        fs,
+        path::Path,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+        thread,
+        time::Duration,
+    };
 
     use clap::ValueEnum;
+    use dialoguer::{theme::ColorfulTheme, Select};
+    use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
     use heck::ToUpperCamelCase;
     use serde::Deserialize;
 
@@ -503,7 +515,7 @@ pub mod kv {
     };
     use crate::context::AppConfigurationContext;
 
-    #[derive(Clone, Debug, ValueEnum)]
+    #[derive(Clone, Copy, Debug, ValueEnum)]
     pub enum ExportFormat {
         Json,
         Yaml,
@@ -532,6 +544,21 @@ pub mod kv {
         app_name: Option<String>,
         label: Option<String>,
         keyvault: Option<String>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum EntryValueType {
+        Plain,
+        KeyVault,
+        Prompt,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ImportFormat {
+        Json,
+        Yaml,
+        Toml,
+        Env,
     }
 
     pub fn list_keys() {
@@ -746,10 +773,18 @@ pub mod kv {
         }
     }
 
-    pub fn export_entries(format: ExportFormat) {
+    pub fn export_entries(format: Option<ExportFormat>, file: &Path) {
+        let format = format.unwrap_or(ExportFormat::Toml);
         let Some(ctx) = resolve_active_context(true, true) else {
             return;
         };
+
+        let spinner = ProgressBar::new_spinner();
+        if let Ok(style) = ProgressStyle::with_template("{spinner:.green} {msg}") {
+            spinner.set_style(style);
+        }
+        spinner.enable_steady_tick(Duration::from_millis(80));
+        spinner.set_message("Fetching configuration entries...");
 
         let entries = match fetch_entries(&ctx) {
             Ok(entries) => entries,
@@ -759,7 +794,13 @@ pub mod kv {
             }
         };
 
+        spinner.set_message("Preparing export payload...");
+
         let mut map = serde_json::Map::new();
+        let mut total = 0usize;
+        let mut keyvault_count = 0usize;
+        let mut plain_count = 0usize;
+
         for entry in entries {
             let key = strip_prefix(&ctx, &entry.key);
             let (value, from_keyvault) = resolve_value(&entry, true);
@@ -774,23 +815,57 @@ pub mod kv {
             );
             obj.insert("value".to_string(), serde_json::Value::String(value));
             map.insert(key, serde_json::Value::Object(obj));
+
+            total += 1;
+            if from_keyvault {
+                keyvault_count += 1;
+            } else {
+                plain_count += 1;
+            }
         }
 
         let payload = serde_json::Value::Object(map);
 
-        match format {
-            ExportFormat::Json => match serde_json::to_string_pretty(&payload) {
-                Ok(data) => println!("{data}"),
-                Err(err) => eprintln!("Failed to serialize JSON: {err}"),
-            },
-            ExportFormat::Yaml => match serde_yaml::to_string(&payload) {
-                Ok(data) => println!("{data}"),
-                Err(err) => eprintln!("Failed to serialize YAML: {err}"),
-            },
-            ExportFormat::Toml => match toml::to_string_pretty(&payload) {
-                Ok(data) => println!("{data}"),
-                Err(err) => eprintln!("Failed to serialize TOML: {err}"),
-            },
+        spinner.finish_with_message(format!(
+            "Prepared {} entries (plain {}, keyvault {}).",
+            total, plain_count, keyvault_count
+        ));
+
+        let serialized = match format {
+            ExportFormat::Json => serde_json::to_string_pretty(&payload)
+                .map_err(|err| format!("Failed to serialize JSON: {err}")),
+            ExportFormat::Yaml => {
+                serde_yaml::to_string(&payload).map_err(|err| format!("Failed to serialize YAML: {err}"))
+            }
+            ExportFormat::Toml => {
+                toml::to_string_pretty(&payload).map_err(|err| format!("Failed to serialize TOML: {err}"))
+            }
+        };
+
+        let data = match serialized {
+            Ok(data) => data,
+            Err(err) => {
+                eprintln!("{err}");
+                return;
+            }
+        };
+
+        if let Err(err) = fs::write(file, data.as_bytes()) {
+            eprintln!("Failed to write {}: {}", file.display(), err);
+            return;
+        }
+
+        if total == 0 {
+            println!(
+                "No keys found for App Configuration '{}' (label: {}).",
+                ctx.config_name,
+                ctx.label.as_deref().unwrap_or("(none)")
+            );
+        } else {
+            println!(
+                "Exported {} entries (plain {}, keyvault {}) as {:?} → '{}'.",
+                total, plain_count, keyvault_count, format, file.display()
+            );
         }
     }
 
@@ -803,31 +878,139 @@ pub mod kv {
             return;
         };
 
-        let mut imported = 0usize;
-        for entry in entries {
-            let full_key = prefix_key(&ctx, &entry.key);
-            let lower_type = entry.value_type.to_ascii_lowercase();
-            let write_result = match lower_type.as_str() {
-                "keyvault" => match build_keyvault_reference(&ctx, &full_key, &entry.value) {
-                    Some(secret_uri) => write_keyvault_entry(&ctx, &full_key, &secret_uri),
+        let mut prepared_entries = Vec::new();
+        let mut skipped = 0usize;
+
+        for mut entry in entries {
+            if entry.value_type == EntryValueType::Prompt {
+                match prompt_value_type(&entry.key) {
+                    Some(kind) => entry.value_type = kind,
                     None => {
-                        eprintln!(
-                            "Skipping '{}' (keyvault type) because no Key Vault is configured.",
-                            entry.key
-                        );
+                        println!("Skipping '{}' as requested.", entry.key);
+                        skipped += 1;
                         continue;
                     }
-                },
-                _ => write_entry(&ctx, &full_key, &entry.value, None),
-            };
+                }
+            }
 
-            match write_result {
-                Ok(_) => imported += 1,
-                Err(err) => eprintln!("Failed to import '{}': {err}", entry.key),
+            prepared_entries.push(entry);
+        }
+
+        if prepared_entries.is_empty() {
+            if skipped > 0 {
+                println!(
+                    "No entries to import; skipped {} {} during prompting.",
+                    skipped,
+                    if skipped == 1 { "entry" } else { "entries" }
+                );
+            } else {
+                println!("No entries to import.");
+            }
+            return;
+        }
+
+        let total = prepared_entries.len();
+        let config_name = ctx.config_name.clone();
+        let ctx = Arc::new(ctx);
+        let queue = Arc::new(Mutex::new(VecDeque::from(prepared_entries)));
+        let successes = Arc::new(AtomicUsize::new(0));
+        let failures = Arc::new(AtomicUsize::new(0));
+
+        let multi = MultiProgress::new();
+        let summary = multi.add(ProgressBar::new(total as u64));
+        if let Ok(style) = ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] {wide_bar:.cyan/blue} {pos}/{len} {msg}",
+        ) {
+            summary.set_style(style);
+        }
+        summary.set_message("Import summary");
+        summary.enable_steady_tick(Duration::from_millis(80));
+
+        let entry_style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner());
+        let entry_style = Arc::new(entry_style);
+
+        let mut worker_count = thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(4);
+        worker_count = worker_count.min(total).max(1);
+
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let ctx = Arc::clone(&ctx);
+            let queue = Arc::clone(&queue);
+            let success_counter = Arc::clone(&successes);
+            let failure_counter = Arc::clone(&failures);
+            let summary_bar = summary.clone();
+            let mp = multi.clone();
+            let entry_style = Arc::clone(&entry_style);
+
+            handles.push(thread::spawn(move || loop {
+                let entry = {
+                    let mut guard = queue.lock().expect("import queue poisoned");
+                    guard.pop_front()
+                };
+
+                let Some(entry) = entry else {
+                    break;
+                };
+
+                let spinner = mp.add(ProgressBar::new_spinner());
+                spinner.set_style(entry_style.as_ref().clone());
+                spinner.set_message(format!(
+                    "{} {}",
+                    entry.key,
+                    entry.value_type.label()
+                ));
+                spinner.enable_steady_tick(Duration::from_millis(80));
+
+                if process_import_entry(ctx.as_ref(), &entry) {
+                    success_counter.fetch_add(1, Ordering::Relaxed);
+                    spinner.finish_with_message(format!(
+                        "✔ {} {}",
+                        entry.key,
+                        entry.value_type.label()
+                    ));
+                } else {
+                    failure_counter.fetch_add(1, Ordering::Relaxed);
+                    spinner.finish_with_message(format!(
+                        "✖ {} (see logs)",
+                        entry.key
+                    ));
+                }
+
+                summary_bar.inc(1);
+            }));
+        }
+
+        for handle in handles {
+            if let Err(err) = handle.join() {
+                eprintln!("An import worker thread panicked: {err:?}");
             }
         }
 
-        println!("Imported {} entries into '{}'.", imported, ctx.config_name);
+        summary.finish_with_message(format!(
+            "Imported {} of {} entries into '{}'.",
+            successes.load(Ordering::Relaxed),
+            total,
+            config_name
+        ));
+        if skipped > 0 {
+            println!(
+                "Skipped {} {} during prompting.",
+                skipped,
+                if skipped == 1 { "entry" } else { "entries" }
+            );
+        }
+
+        let failed = failures.load(Ordering::Relaxed);
+        if failed > 0 {
+            eprintln!(
+                "Failed to import {} {}. See logs above for details.",
+                failed,
+                if failed == 1 { "entry" } else { "entries" }
+            );
+        }
     }
 
     fn resolve_active_context(require_app: bool, require_label: bool) -> Option<ActiveKvContext> {
@@ -1168,7 +1351,7 @@ pub mod kv {
     struct ImportEntry {
         key: String,
         value: String,
-        value_type: String,
+        value_type: EntryValueType,
     }
 
     fn parse_import_map(path: &Path) -> Option<Vec<ImportEntry>> {
@@ -1180,53 +1363,183 @@ pub mod kv {
             }
         };
 
+        if contents.trim().is_empty() {
+            eprintln!("Import file {} is empty.", path.display());
+            return None;
+        }
+
         let ext = path
             .extension()
             .and_then(|ext| ext.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
 
-        let parsed: Result<serde_json::Value, String> =
-            match ext.as_str() {
-                "yaml" | "yml" => serde_yaml::from_str::<serde_json::Value>(&contents)
-                    .map_err(|err| err.to_string()),
-                "toml" => toml::from_str::<toml::Value>(&contents)
-                    .map_err(|err| err.to_string())
-                    .and_then(|value| serde_json::to_value(value).map_err(|err| err.to_string())),
-                _ => serde_json::from_str::<serde_json::Value>(&contents)
-                    .map_err(|err| err.to_string()),
+        let mut errors = Vec::new();
+        for format in format_detection_order(&ext, file_name) {
+            match parse_with_format(format, &contents) {
+                Ok(entries) if entries.is_empty() => {
+                    eprintln!("No entries found in {}.", path.display());
+                    return None;
+                }
+                Ok(entries) => return Some(entries),
+                Err(err) => errors.push((format, err)),
+            }
+        }
+
+        if let Some((format, err)) = errors.last() {
+            eprintln!(
+                "Failed to parse {} as {}: {}",
+                path.display(),
+                format.label(),
+                err
+            );
+        } else {
+            eprintln!(
+                "Failed to parse {} as JSON, YAML, TOML, or env.",
+                path.display()
+            );
+        }
+        None
+    }
+
+    fn format_detection_order(ext: &str, file_name: &str) -> Vec<ImportFormat> {
+        let mut order = Vec::new();
+        let mut push_unique = |fmt| {
+            if !order.contains(&fmt) {
+                order.push(fmt);
+            }
+        };
+
+        match ext {
+            "json" => push_unique(ImportFormat::Json),
+            "yaml" | "yml" => push_unique(ImportFormat::Yaml),
+            "toml" => push_unique(ImportFormat::Toml),
+            "env" => push_unique(ImportFormat::Env),
+            _ => {}
+        }
+
+        if is_env_like(file_name) {
+            push_unique(ImportFormat::Env);
+        }
+
+        push_unique(ImportFormat::Json);
+        push_unique(ImportFormat::Yaml);
+        push_unique(ImportFormat::Toml);
+        push_unique(ImportFormat::Env);
+
+        order
+    }
+
+    fn is_env_like(name: &str) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+
+        let lowered = name.to_ascii_lowercase();
+        lowered == "env"
+            || lowered == ".env"
+            || lowered.ends_with(".env")
+            || lowered.contains(".env.")
+    }
+
+    fn parse_with_format(format: ImportFormat, contents: &str) -> Result<Vec<ImportEntry>, String> {
+        match format {
+            ImportFormat::Json => parse_json_entries(contents),
+            ImportFormat::Yaml => parse_yaml_entries(contents),
+            ImportFormat::Toml => parse_toml_entries(contents),
+            ImportFormat::Env => parse_env_entries(contents),
+        }
+    }
+
+    fn parse_json_entries(contents: &str) -> Result<Vec<ImportEntry>, String> {
+        let value: serde_json::Value =
+            serde_json::from_str(contents).map_err(|err| err.to_string())?;
+        entries_from_json_value(value)
+    }
+
+    fn parse_yaml_entries(contents: &str) -> Result<Vec<ImportEntry>, String> {
+        let value: serde_json::Value =
+            serde_yaml::from_str(contents).map_err(|err| err.to_string())?;
+        entries_from_json_value(value)
+    }
+
+    fn parse_toml_entries(contents: &str) -> Result<Vec<ImportEntry>, String> {
+        let value: toml::Value = toml::from_str(contents).map_err(|err| err.to_string())?;
+        let json_value =
+            serde_json::to_value(value).map_err(|err| format!("TOML conversion failed: {err}"))?;
+        entries_from_json_value(json_value)
+    }
+
+    fn parse_env_entries(contents: &str) -> Result<Vec<ImportEntry>, String> {
+        let mut entries = Vec::new();
+        for (idx, raw_line) in contents.lines().enumerate() {
+            let trimmed = raw_line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+
+            let line = trimmed
+                .strip_prefix("export ")
+                .unwrap_or(trimmed)
+                .trim();
+
+            let Some(eq_idx) = line.find('=') else {
+                eprintln!(
+                    "Skipping line {} ({}): missing '='.",
+                    idx + 1,
+                    raw_line.trim()
+                );
+                continue;
             };
 
-        let value = match parsed {
-            Ok(value) => value,
-            Err(err) => {
-                eprintln!("Failed to parse {}: {}", path.display(), err);
-                return None;
+            let key = line[..eq_idx].trim();
+            if key.is_empty() {
+                eprintln!("Skipping line {}: missing key before '='.", idx + 1);
+                continue;
             }
-        };
 
-        let map = match value.as_object() {
-            Some(map) => map,
-            None => {
-                eprintln!("Import file must contain a mapping of keys to values.");
-                return None;
-            }
-        };
+            let raw_value = line[eq_idx + 1..].trim();
+            let value = parse_env_value(raw_value);
 
+            entries.push(ImportEntry {
+                key: key.to_string(),
+                value,
+                value_type: EntryValueType::Prompt,
+            });
+        }
+
+        if entries.is_empty() {
+            Err("no key=value pairs found".to_string())
+        } else {
+            Ok(entries)
+        }
+    }
+
+    fn entries_from_json_value(value: serde_json::Value) -> Result<Vec<ImportEntry>, String> {
+        let map = value.as_object().ok_or_else(|| {
+            "Import file must contain a mapping of keys to values.".to_string()
+        })?;
+
+        Ok(map_to_entries(map))
+    }
+
+    fn map_to_entries(map: &serde_json::Map<String, serde_json::Value>) -> Vec<ImportEntry> {
         let mut entries = Vec::new();
 
         for (key, value) in map {
             if let Some(obj) = value.as_object() {
-                let value_type = obj
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("plain")
-                    .to_string();
+                let value_type = value_type_from_str(obj.get("type").and_then(|v| v.as_str()));
                 let val_str = obj
                     .get("value")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                    .map(|v| match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_default();
                 entries.push(ImportEntry {
                     key: key.to_string(),
                     value: val_str,
@@ -1236,18 +1549,180 @@ pub mod kv {
                 entries.push(ImportEntry {
                     key: key.to_string(),
                     value: val_str.to_string(),
-                    value_type: "plain".to_string(),
+                    value_type: EntryValueType::Plain,
                 });
             } else {
                 entries.push(ImportEntry {
                     key: key.to_string(),
                     value: value.to_string(),
-                    value_type: "plain".to_string(),
+                    value_type: EntryValueType::Plain,
                 });
             }
         }
 
-        Some(entries)
+        entries
+    }
+
+    fn process_import_entry(ctx: &ActiveKvContext, entry: &ImportEntry) -> bool {
+        let full_key = prefix_key(ctx, &entry.key);
+        let write_result = match entry.value_type {
+            EntryValueType::KeyVault => match build_keyvault_reference(ctx, &full_key, &entry.value)
+            {
+                Some(secret_uri) => write_keyvault_entry(ctx, &full_key, &secret_uri),
+                None => {
+                    eprintln!(
+                        "Skipping '{}' (keyvault type) because no Key Vault is configured.",
+                        entry.key
+                    );
+                    return false;
+                }
+            },
+            EntryValueType::Plain => write_entry(ctx, &full_key, &entry.value, None),
+            EntryValueType::Prompt => {
+                eprintln!(
+                    "Internal error: unresolved prompt for '{}'. Skipping entry.",
+                    entry.key
+                );
+                return false;
+            }
+        };
+
+        match write_result {
+            Ok(_) => true,
+            Err(err) => {
+                eprintln!("Failed to import '{}': {err}", entry.key);
+                false
+            }
+        }
+    }
+
+    fn value_type_from_str(value: Option<&str>) -> EntryValueType {
+        let lower = value
+            .map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| "plain".to_string());
+
+        match lower.as_str() {
+            "keyvault" => EntryValueType::KeyVault,
+            "prompt" => EntryValueType::Prompt,
+            _ => EntryValueType::Plain,
+        }
+    }
+
+    fn parse_env_value(raw_value: &str) -> String {
+        let without_comment = strip_env_comment(raw_value);
+        let trimmed = without_comment.trim();
+
+        if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+            return unescape_double_quoted(&trimmed[1..trimmed.len() - 1]);
+        }
+
+        if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+            return trimmed[1..trimmed.len() - 1].to_string();
+        }
+
+        trimmed.to_string()
+    }
+
+    fn strip_env_comment(value: &str) -> &str {
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut escaped = false;
+
+        for (idx, ch) in value.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+
+            match ch {
+                '\\' if in_double => {
+                    escaped = true;
+                }
+                '\'' if !in_double => in_single = !in_single,
+                '"' if !in_single => in_double = !in_double,
+                '#' if !in_single && !in_double => return value[..idx].trim_end(),
+                _ => {}
+            }
+        }
+
+        value
+    }
+
+    fn unescape_double_quoted(input: &str) -> String {
+        let mut result = String::with_capacity(input.len());
+        let mut chars = input.chars();
+
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                if let Some(next) = chars.next() {
+                    match next {
+                        'n' => result.push('\n'),
+                        'r' => result.push('\r'),
+                        't' => result.push('\t'),
+                        '\\' => result.push('\\'),
+                        '"' => result.push('"'),
+                        _ => {
+                            result.push('\\');
+                            result.push(next);
+                        }
+                    }
+                } else {
+                    result.push('\\');
+                }
+            } else {
+                result.push(ch);
+            }
+        }
+
+        result
+    }
+
+    fn prompt_value_type(key: &str) -> Option<EntryValueType> {
+        let labels = [
+            "Store as plain value",
+            "Store in Key Vault",
+            "Skip this entry",
+        ];
+
+        let prompt = format!("Where should key '{}' be stored?", key);
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt(prompt)
+            .default(0)
+            .items(&labels)
+            .interact_opt();
+
+        match selection {
+            Ok(Some(0)) => Some(EntryValueType::Plain),
+            Ok(Some(1)) => Some(EntryValueType::KeyVault),
+            Ok(Some(2)) => None,
+            Ok(Some(_)) => Some(EntryValueType::Plain),
+            Ok(None) => Some(EntryValueType::Plain),
+            Err(err) => {
+                eprintln!("Prompt failed for '{}': {}", key, err);
+                None
+            }
+        }
+    }
+
+    impl EntryValueType {
+        fn label(self) -> &'static str {
+            match self {
+                EntryValueType::Plain => "[plain]",
+                EntryValueType::KeyVault => "[keyvault]",
+                EntryValueType::Prompt => "[prompt]",
+            }
+        }
+    }
+
+    impl ImportFormat {
+        fn label(self) -> &'static str {
+            match self {
+                ImportFormat::Json => "JSON",
+                ImportFormat::Yaml => "YAML",
+                ImportFormat::Toml => "TOML",
+                ImportFormat::Env => ".env",
+            }
+        }
     }
 
     fn build_keyvault_reference(
