@@ -3,7 +3,6 @@ use serde::Deserialize;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AppConfig {
-    pub id: String,
     pub name: String,
 }
 

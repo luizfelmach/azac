@@ -194,7 +194,7 @@ pub mod app {
     use serde::Deserialize;
 
     use crate::azcli::{
-        error::{AzCliError, AzCliResult},
+        error::AzCliResult,
         run::az,
     };
 
@@ -249,16 +249,16 @@ pub mod app {
             None => return,
         };
 
-        let Some(active) = context.active.as_mut() else {
-            super::missing_setup_message();
-            return;
+        let config_name = {
+            let Some(active) = context.active.as_mut() else {
+                super::missing_setup_message();
+                return;
+            };
+
+            active.current_app = Some(name.to_string());
+            active.apps.entry(name.to_string()).or_default();
+            active.config_name.clone()
         };
-
-        active.current_app = Some(name.to_string());
-        active.apps.entry(name.to_string()).or_default();
-
-        let config_name = active.config_name.clone();
-        drop(active);
 
         if super::save_context(&store, &context) {
             println!(
@@ -301,22 +301,21 @@ pub mod app {
             None => return,
         };
 
-        let Some(active) = context.active.as_mut() else {
-            super::missing_setup_message();
-            return;
-        };
+        let app_name = {
+            let Some(active) = context.active.as_mut() else {
+                super::missing_setup_message();
+                return;
+            };
 
-        let Some(app_name) = active.current_app.clone() else {
-            eprintln!("No application selected. Use `azac app use <name>` first.");
-            return;
-        };
+            let Some(app_name) = active.current_app.clone() else {
+                eprintln!("No application selected. Use `azac app use <name>` first.");
+                return;
+            };
 
-        {
             let app_ctx = active.apps.entry(app_name.clone()).or_default();
             app_ctx.label = Some(label.to_string());
-        }
-
-        drop(active);
+            app_name
+        };
 
         if super::save_context(&store, &context) {
             println!("Set label for '{}' to '{}'.", app_name, label);
@@ -329,22 +328,21 @@ pub mod app {
             None => return,
         };
 
-        let Some(active) = context.active.as_mut() else {
-            super::missing_setup_message();
-            return;
-        };
+        let app_name = {
+            let Some(active) = context.active.as_mut() else {
+                super::missing_setup_message();
+                return;
+            };
 
-        let Some(app_name) = active.current_app.clone() else {
-            eprintln!("No application selected. Use `azac app use <name>` first.");
-            return;
-        };
+            let Some(app_name) = active.current_app.clone() else {
+                eprintln!("No application selected. Use `azac app use <name>` first.");
+                return;
+            };
 
-        {
             let app_ctx = active.apps.entry(app_name.clone()).or_default();
             app_ctx.keyvault = Some(vault.to_string());
-        }
-
-        drop(active);
+            app_name
+        };
 
         if super::save_context(&store, &context) {
             println!("Set Key Vault for '{}' to '{}'.", app_name, vault);
@@ -436,7 +434,6 @@ pub mod kv {
     #[derive(Debug, Deserialize)]
     struct KeyValue {
         key: String,
-        label: Option<String>,
         value: Option<String>,
         #[serde(rename = "contentType")]
         content_type: Option<String>,

@@ -1,10 +1,6 @@
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, fs, path::PathBuf};
 use thiserror::Error;
 
 const DEFAULT_SEPARATOR: &str = ":";
@@ -85,10 +81,6 @@ impl ContextStore {
         Ok(Self {
             path: dirs.config_dir().join("context.yaml"),
         })
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 }
 
