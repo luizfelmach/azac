@@ -4,6 +4,7 @@ use crate::{
 };
 use dialoguer::{theme::ColorfulTheme, Input, Select};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use owo_colors::OwoColorize;
 use std::{
     collections::BTreeMap,
     sync::mpsc,
@@ -103,10 +104,8 @@ pub fn setup() {
     let labels: Vec<String> = options
         .iter()
         .map(|option| {
-            format!(
-                "{} │ {}",
-                option.subscription.name, option.config.name
-            )
+            let sub = format!("({})", option.subscription.name);
+            format!("{} {}", option.config.name, sub.dimmed())
         })
         .collect();
 
