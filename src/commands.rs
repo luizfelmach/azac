@@ -505,8 +505,9 @@ pub mod kv {
 
     use clap::ValueEnum;
     use dialoguer::{theme::ColorfulTheme, Select};
-    use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
     use heck::ToUpperCamelCase;
+    use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+    use owo_colors::OwoColorize;
     use serde::Deserialize;
 
     use crate::azcli::{
@@ -561,64 +562,137 @@ pub mod kv {
         Env,
     }
 
-    pub fn list_keys() {
-        let Some(ctx) = resolve_active_context(true, true) else {
-            return;
+    fn create_spinner(initial_message: &str) -> ProgressBar {
+        let spinner = ProgressBar::new_spinner();
+        let style = ProgressStyle::with_template("{spinner:.green} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner());
+        spinner.set_style(style);
+        spinner.enable_steady_tick(Duration::from_millis(80));
+        spinner.set_message(initial_message.to_string());
+        spinner
+    }
+
+    fn truncate_value(value: &str, limit: usize) -> String {
+        if value.chars().count() <= limit {
+            return value.to_string();
+        }
+
+        let keep = limit.saturating_sub(3);
+        let prefix: String = value.chars().take(keep).collect();
+        format!("{prefix}...")
+    }
+
+    fn format_key_line(name: &str, preview: &str, is_secret: bool, is_empty: bool) -> String {
+        let mut left = format!("{}", name.bold().bright_white());
+        if is_secret {
+            left.push(' ');
+            left.push_str(&format!("{}", "[keyvault]".yellow()));
+        }
+
+        let quoted = format!("\"{preview}\"");
+        let styled_preview = if is_empty {
+            format!("{}", quoted.dimmed())
+        } else if is_secret {
+            format!("{}", quoted.yellow())
+        } else {
+            format!("{}", quoted.cyan())
         };
 
+        format!("{left}: {styled_preview}")
+    }
+
+    pub fn list_keys() {
+        let spinner = create_spinner("Resolving configuration context...");
+        let ctx = match resolve_active_context(true, true) {
+            Some(ctx) => ctx,
+            None => {
+                spinner.finish_and_clear();
+                return;
+            }
+        };
+
+        spinner.set_message("Fetching configuration entries...");
         let entries = match fetch_entries(&ctx) {
             Ok(entries) => entries,
             Err(err) => {
+                spinner.finish_and_clear();
                 eprintln!("Failed to list keys: {err}");
                 return;
             }
         };
 
+        spinner.finish_with_message("Entries fetched.");
+
         if entries.is_empty() {
-            let app_suffix = ctx
-                .app_name
-                .as_ref()
-                .map(|app| format!(" and app '{}'", app))
-                .unwrap_or_default();
+            let app = ctx.app_name.as_deref().unwrap_or("(none)");
+            let label = ctx.label.as_deref().unwrap_or("(none)");
             println!(
-                "No keys found for App Configuration '{}'{}.",
-                ctx.config_name, app_suffix
+                "No keys found (label: {}, app: {}).",
+                label, app
             );
             return;
         }
 
         for entry in entries {
             let key = strip_prefix(&ctx, &entry.key);
-            let (value, from_keyvault) = resolve_value(&entry, false);
-            if from_keyvault {
-                println!("- {} [keyvault]", key);
+            let (value, from_keyvault) = resolve_value(&entry, false, false);
+
+            let detail = if from_keyvault {
+                keyvault_uri_from_entry(&entry)
+                    .map(|uri| truncate_value(&uri, 80))
+                    .unwrap_or_else(|| "[key vault reference]".to_string())
+            } else if value.is_empty() {
+                "(empty)".to_string()
             } else {
-                println!("- {} = {}", key, value);
-            }
+                truncate_value(&value, 80)
+            };
+
+            let line = format_key_line(&key, &detail, from_keyvault, detail == "(empty)");
+            println!("{line}");
         }
     }
 
     pub fn show_key(key: &str) {
-        let Some(ctx) = resolve_active_context(true, true) else {
-            return;
-        };
-
-        let full_key = prefix_key(&ctx, key);
-        let entry = match show_entry(&ctx, &full_key) {
-            Ok(entry) => entry,
-            Err(err) => {
-                eprintln!("Failed to fetch key: {err}");
+        let spinner = create_spinner("Resolving configuration context...");
+        let ctx = match resolve_active_context(true, true) {
+            Some(ctx) => ctx,
+            None => {
+                spinner.finish_and_clear();
                 return;
             }
         };
 
+        spinner.set_message(format!("Fetching '{}'...", key));
+        let full_key = prefix_key(&ctx, key);
+        let entry = match show_entry(&ctx, &full_key) {
+            Ok(entry) => entry,
+            Err(err) => {
+                spinner.finish_and_clear();
+                eprintln!("Failed to fetch key: {err}");
+                return;
+            }
+        };
+        spinner.finish_with_message(format!("Fetched '{}'.", key));
+
         let display_key = strip_prefix(&ctx, &entry.key);
-        let (value, from_keyvault) = resolve_value(&entry, true);
-        if from_keyvault {
-            println!("- {} [keyvault]", display_key);
-            println!("  value: {}", value);
+        let (value, from_keyvault) = resolve_value(&entry, true, true);
+        let keyvault_uri = keyvault_uri_from_entry(&entry);
+
+        let detail = if value.is_empty() {
+            "(empty)".to_string()
         } else {
-            println!("- {} = {}", display_key, value);
+            truncate_value(&value, 120)
+        };
+
+        let line = format_key_line(&display_key, &detail, from_keyvault, detail == "(empty)");
+        println!("{line}");
+        if from_keyvault {
+            if let Some(secret_uri) = keyvault_uri {
+                println!(
+                    "{}",
+                    format!("  ↳ {}", truncate_value(&secret_uri, 120)).dimmed()
+                );
+            }
         }
     }
 
@@ -803,7 +877,7 @@ pub mod kv {
 
         for entry in entries {
             let key = strip_prefix(&ctx, &entry.key);
-            let (value, from_keyvault) = resolve_value(&entry, true);
+            let (value, from_keyvault) = resolve_value(&entry, true, false);
             let mut obj = serde_json::Map::new();
             obj.insert(
                 "type".to_string(),
@@ -1228,10 +1302,21 @@ pub mod kv {
         Ok(())
     }
 
-    fn resolve_value(entry: &KeyValue, fetch_secret: bool) -> (String, bool) {
+    fn resolve_value(entry: &KeyValue, fetch_secret: bool, show_activity: bool) -> (String, bool) {
         if let Some(uri) = keyvault_uri_from_entry(entry) {
             if fetch_secret {
-                match fetch_secret_value(&uri) {
+                let spinner = show_activity.then(|| create_spinner("Fetching Key Vault secret..."));
+
+                let result = fetch_secret_value(&uri);
+
+                if let Some(spinner) = spinner {
+                    match &result {
+                        Ok(_) => spinner.finish_with_message("Key Vault secret fetched."),
+                        Err(_) => spinner.finish_and_clear(),
+                    }
+                }
+
+                match result {
                     Ok(secret) => return (secret, true),
                     Err(err) => {
                         eprintln!("Failed to resolve Key Vault secret {}: {}", uri, err);
