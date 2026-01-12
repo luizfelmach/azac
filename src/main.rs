@@ -28,6 +28,7 @@ enum Command {
     #[command(subcommand)]
     App(AppCommand),
     /// List keys for the current App Configuration/App context
+    #[command(alias = "ls")]
     List,
     /// Show a key by name
     Show { key: String },
