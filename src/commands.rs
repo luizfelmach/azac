@@ -1,16 +1,13 @@
 use crate::{
     azcli::{appconfig, subscription},
-    context::{default_separator, ActiveContext, Context, ContextStore, SubscriptionMetadata},
+    context::{
+        default_separator, ActiveContext, AppSelection, Context, ContextStore, SubscriptionMetadata,
+    },
 };
 use dialoguer::{theme::ColorfulTheme, Input, Select};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
-use std::{
-    collections::BTreeMap,
-    sync::mpsc,
-    thread,
-    time::Duration,
-};
+use std::{sync::mpsc, thread, time::Duration};
 
 pub fn setup() {
     let theme = ColorfulTheme::default();
@@ -150,15 +147,13 @@ pub fn setup() {
         None => return,
     };
 
-    let mut preserved_current = None;
-    let mut preserved_apps = BTreeMap::new();
+    let mut preserved_app = AppSelection::default();
 
     if let Some(existing) = context.active.take() {
         if existing.subscription.id == selected.subscription.id
             && existing.config_name == selected.config.name
         {
-            preserved_current = existing.current_app;
-            preserved_apps = existing.apps;
+            preserved_app = existing.app;
         }
     }
 
@@ -169,8 +164,7 @@ pub fn setup() {
         },
         config_name: selected.config.name.clone(),
         separator,
-        current_app: preserved_current,
-        apps: preserved_apps,
+        app: preserved_app,
     };
 
     context.active = Some(active);
@@ -190,7 +184,10 @@ struct ConfigOption {
 
 pub mod app {
     use std::collections::BTreeSet;
+    use std::time::Duration;
 
+    use dialoguer::{theme::ColorfulTheme, Select};
+    use indicatif::ProgressBar;
     use serde::Deserialize;
 
     use crate::azcli::{
@@ -198,28 +195,50 @@ pub mod app {
         run::az,
     };
 
-    pub fn list_apps() {
-        let (_, context) = match super::load_context() {
+    pub fn select_app() {
+        let theme = ColorfulTheme::default();
+
+        let (store, mut context) = match super::load_context() {
             Some(value) => value,
             None => return,
         };
 
-        let Some(active) = context.active.as_ref() else {
-            super::missing_setup_message();
-            return;
+        let (subscription_id, config_name, separator, current_app) = {
+            let Some(active) = context.active.as_ref() else {
+                super::missing_setup_message();
+                return;
+            };
+
+            (
+                active.subscription.id.clone(),
+                active.config_name.clone(),
+                active.separator.clone(),
+                active.app.name.clone(),
+            )
         };
 
-        let entries = match fetch_all_keys(&active.config_name, &active.subscription.id) {
+        let spinner = ProgressBar::new_spinner();
+        spinner.set_style(super::standard_spinner_style());
+        spinner.enable_steady_tick(Duration::from_millis(80));
+        spinner.set_message(format!(
+            "Inspecting keys in '{}'...",
+            config_name
+        ));
+
+        let entries = match fetch_all_keys(&config_name, &subscription_id) {
             Ok(entries) => entries,
             Err(err) => {
+                spinner.finish_and_clear();
                 eprintln!("Failed to list applications: {err}");
                 return;
             }
         };
 
+        spinner.finish_and_clear();
+
         let mut apps = BTreeSet::new();
         for entry in entries {
-            if let Some(idx) = entry.key.rfind(&active.separator) {
+            if let Some(idx) = entry.key.rfind(&separator) {
                 let prefix = &entry.key[..idx];
                 apps.insert(prefix.to_string());
             }
@@ -228,25 +247,44 @@ pub mod app {
         if apps.is_empty() {
             println!(
                 "No applications inferred from keys in '{}'.",
-                active.config_name
+                config_name
             );
             return;
         }
 
-        for app_name in apps {
-            let marker = if active.current_app.as_deref() == Some(app_name.as_str()) {
-                "*"
-            } else {
-                " "
-            };
-            println!("[{}] {}", marker, app_name);
-        }
-    }
+        let app_names: Vec<String> = apps.into_iter().collect();
+        let display: Vec<String> = app_names
+            .iter()
+            .map(|name| {
+                if current_app.as_deref() == Some(name.as_str()) {
+                    format!("* {}", name)
+                } else {
+                    format!("  {}", name)
+                }
+            })
+            .collect();
 
-    pub fn use_app(name: &str) {
-        let (store, mut context) = match super::load_context() {
-            Some(value) => value,
-            None => return,
+        let default_index = current_app
+            .as_ref()
+            .and_then(|current| app_names.iter().position(|name| name == current))
+            .unwrap_or(0);
+
+        let selection = Select::with_theme(&theme)
+            .with_prompt("Select the application prefix:")
+            .items(&display)
+            .default(default_index.min(display.len().saturating_sub(1)))
+            .interact_opt();
+
+        let selected = match selection {
+            Ok(Some(index)) => app_names[index].clone(),
+            Ok(None) => {
+                println!("Application selection aborted.");
+                return;
+            }
+            Err(err) => {
+                eprintln!("Application selection failed: {err}");
+                return;
+            }
         };
 
         let config_name = {
@@ -255,127 +293,18 @@ pub mod app {
                 return;
             };
 
-            active.current_app = Some(name.to_string());
-            active.apps.entry(name.to_string()).or_default();
+            active.app.name = Some(selected.clone());
+            active.app.label = None;
+            active.app.keyvault = None;
             active.config_name.clone()
         };
 
         if super::save_context(&store, &context) {
             println!(
                 "Using application '{}' under App Configuration '{}'.",
-                name, config_name
+                selected, config_name
             );
         }
-    }
-
-    pub fn show_app(name: &str) {
-        let (_, context) = match super::load_context() {
-            Some(value) => value,
-            None => return,
-        };
-
-        let Some(active) = context.active.as_ref() else {
-            super::missing_setup_message();
-            return;
-        };
-
-        let Some(app_ctx) = active.apps.get(name) else {
-            eprintln!(
-                "Application '{}' not defined for '{}'.",
-                name, active.config_name
-            );
-            return;
-        };
-
-        println!("App: {}", name);
-        println!("Label: {}", app_ctx.label.as_deref().unwrap_or("(none)"));
-        println!(
-            "Key Vault: {}",
-            app_ctx.keyvault.as_deref().unwrap_or("(none)")
-        );
-    }
-
-    pub fn set_label(label: &str) {
-        let (store, mut context) = match super::load_context() {
-            Some(value) => value,
-            None => return,
-        };
-
-        let app_name = {
-            let Some(active) = context.active.as_mut() else {
-                super::missing_setup_message();
-                return;
-            };
-
-            let Some(app_name) = active.current_app.clone() else {
-                eprintln!("No application selected. Use `azac app use <name>` first.");
-                return;
-            };
-
-            let app_ctx = active.apps.entry(app_name.clone()).or_default();
-            app_ctx.label = Some(label.to_string());
-            app_name
-        };
-
-        if super::save_context(&store, &context) {
-            println!("Set label for '{}' to '{}'.", app_name, label);
-        }
-    }
-
-    pub fn set_keyvault(vault: &str) {
-        let (store, mut context) = match super::load_context() {
-            Some(value) => value,
-            None => return,
-        };
-
-        let app_name = {
-            let Some(active) = context.active.as_mut() else {
-                super::missing_setup_message();
-                return;
-            };
-
-            let Some(app_name) = active.current_app.clone() else {
-                eprintln!("No application selected. Use `azac app use <name>` first.");
-                return;
-            };
-
-            let app_ctx = active.apps.entry(app_name.clone()).or_default();
-            app_ctx.keyvault = Some(vault.to_string());
-            app_name
-        };
-
-        if super::save_context(&store, &context) {
-            println!("Set Key Vault for '{}' to '{}'.", app_name, vault);
-        }
-    }
-
-    pub fn show_current_app() {
-        let (_, context) = match super::load_context() {
-            Some(value) => value,
-            None => return,
-        };
-
-        let Some(active) = context.active.as_ref() else {
-            super::missing_setup_message();
-            return;
-        };
-
-        let Some(app_name) = &active.current_app else {
-            eprintln!("No application selected for '{}'.", active.config_name);
-            return;
-        };
-
-        let app_ctx = active.apps.get(app_name);
-        let label = app_ctx
-            .and_then(|ctx| ctx.label.as_deref())
-            .unwrap_or("(none)");
-        let keyvault = app_ctx
-            .and_then(|ctx| ctx.keyvault.as_deref())
-            .unwrap_or("(none)");
-
-        println!("App: {}", app_name);
-        println!("Label: {}", label);
-        println!("Key Vault: {}", keyvault);
     }
 
     #[derive(Debug, Deserialize)]
@@ -510,7 +439,7 @@ pub mod kv {
 
     pub fn list_keys() {
         let spinner = create_spinner("Resolving configuration context...");
-        let ctx = match resolve_active_context(true, true) {
+        let ctx = match resolve_active_context(true, false) {
             Some(ctx) => ctx,
             None => {
                 spinner.finish_and_clear();
@@ -561,7 +490,7 @@ pub mod kv {
 
     pub fn show_key(key: &str) {
         let spinner = create_spinner("Resolving configuration context...");
-        let ctx = match resolve_active_context(true, true) {
+        let ctx = match resolve_active_context(true, false) {
             Some(ctx) => ctx,
             None => {
                 spinner.finish_and_clear();
@@ -604,7 +533,7 @@ pub mod kv {
     }
 
     pub fn set_key(key: &str, value: &str, use_keyvault: bool) {
-        let Some(ctx) = resolve_active_context(true, true) else {
+        let Some(ctx) = resolve_active_context(true, false) else {
             return;
         };
 
@@ -650,7 +579,7 @@ pub mod kv {
     }
 
     pub fn promote_key(key: &str) {
-        let Some(ctx) = resolve_active_context(true, true) else {
+        let Some(ctx) = resolve_active_context(true, false) else {
             return;
         };
 
@@ -691,7 +620,7 @@ pub mod kv {
     }
 
     pub fn demote_key(key: &str) {
-        let Some(ctx) = resolve_active_context(true, true) else {
+        let Some(ctx) = resolve_active_context(true, false) else {
             return;
         };
 
@@ -731,7 +660,7 @@ pub mod kv {
     }
 
     pub fn delete_keys(keys: &[String]) {
-        let Some(ctx) = resolve_active_context(true, true) else {
+        let Some(ctx) = resolve_active_context(true, false) else {
             return;
         };
 
@@ -756,7 +685,7 @@ pub mod kv {
 
     pub fn export_entries(format: Option<ExportFormat>, file: &Path) {
         let format = format.unwrap_or(ExportFormat::Toml);
-        let Some(ctx) = resolve_active_context(true, true) else {
+        let Some(ctx) = resolve_active_context(true, false) else {
             return;
         };
 
@@ -851,7 +780,7 @@ pub mod kv {
     }
 
     pub fn import_entries(path: &Path) {
-        let Some(ctx) = resolve_active_context(true, true) else {
+        let Some(ctx) = resolve_active_context(true, false) else {
             return;
         };
 
@@ -1005,27 +934,27 @@ pub mod kv {
             return None;
         };
 
-        let app_name = active.current_app.clone();
+        let app_name = active.app.name.clone();
 
         if require_app && app_name.is_none() {
-            eprintln!("No application selected. Use `azac app use <name>` first.");
+            eprintln!("No application selected. Run `azac app` to pick one.");
             return None;
         }
 
-        let app_ctx = app_name
-            .as_ref()
-            .and_then(|name| active.apps.get(name));
-
-        let label = app_ctx
-            .and_then(|ctx| ctx.label.clone())
+        let label = active
+            .app
+            .label
+            .clone()
             .filter(|lbl| !lbl.is_empty());
         if require_label && label.is_none() {
-            eprintln!("No label configured. Set one with `azac app label <label>` first.");
+            eprintln!("No label configured for the current application.");
             return None;
         }
 
-        let keyvault = app_ctx
-            .and_then(|ctx| ctx.keyvault.clone())
+        let keyvault = active
+            .app
+            .keyvault
+            .clone()
             .filter(|kv| !kv.is_empty());
 
         Some(ActiveKvContext {
@@ -1696,7 +1625,7 @@ pub mod kv {
         let vault_base = match ensure_vault_base(ctx) {
             Some(base) => base,
             None => {
-                eprintln!("No Key Vault configured. Set one with `azac app keyvault <vault>` first.");
+                eprintln!("No Key Vault configured for the current application.");
                 return None;
             }
         };

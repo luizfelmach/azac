@@ -23,9 +23,8 @@ struct Cli {
 enum Command {
     /// Configure the active App Configuration context
     Setup,
-    /// Manage applications under the current App Configuration
-    #[command(subcommand)]
-    App(AppCommand),
+    /// Select the active application inferred from the current App Configuration
+    App,
     /// List keys for the current App Configuration/App context
     #[command(alias = "ls")]
     List,
@@ -57,35 +56,12 @@ enum Command {
     Demote { key: String },
 }
 
-#[derive(Subcommand)]
-enum AppCommand {
-    /// List available applications
-    List,
-    /// Set the active application
-    Use { app: String },
-    /// Show application details
-    Show { app: String },
-    /// Set the label for the current application
-    Label { label: String },
-    /// Set the Key Vault reference for the current application
-    Keyvault { vault: String },
-    /// Display the currently selected application
-    Current,
-}
-
 fn main() {
     let cli = Cli::parse();
 
     match cli.command {
         Command::Setup => commands::setup(),
-        Command::App(app_command) => match app_command {
-            AppCommand::List => app::list_apps(),
-            AppCommand::Use { app } => app::use_app(&app),
-            AppCommand::Show { app } => app::show_app(&app),
-            AppCommand::Label { label } => app::set_label(&label),
-            AppCommand::Keyvault { vault } => app::set_keyvault(&vault),
-            AppCommand::Current => app::show_current_app(),
-        },
+        Command::App => app::select_app(),
         Command::List => kv::list_keys(),
         Command::Show { key } => kv::show_key(&key),
         Command::Set {

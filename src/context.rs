@@ -1,6 +1,6 @@
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{fs, path::PathBuf};
 use thiserror::Error;
 
 const DEFAULT_SEPARATOR: &str = ":";
@@ -29,9 +29,7 @@ pub struct ActiveContext {
     #[serde(default = "default_separator")]
     pub separator: String,
     #[serde(default)]
-    pub current_app: Option<String>,
-    #[serde(default)]
-    pub apps: BTreeMap<String, AppContext>,
+    pub app: AppSelection,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -41,7 +39,8 @@ pub struct SubscriptionMetadata {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct AppContext {
+pub struct AppSelection {
+    pub name: Option<String>,
     pub label: Option<String>,
     pub keyvault: Option<String>,
 }
