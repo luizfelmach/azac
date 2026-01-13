@@ -352,18 +352,13 @@ pub mod app {
 
         let mut label_options = Vec::with_capacity(labels.len() + 2);
         for label in labels.iter() {
-            let prefix = if current_label.as_deref() == Some(label.as_str()) {
-                "* "
-            } else {
-                "  "
-            };
             label_options.push(LabelOption {
-                display: format!("{prefix}{label}"),
+                display: format!("  {label}"),
                 choice: LabelChoice::Existing(label.clone()),
             });
         }
 
-        let no_label_prefix = if current_label.is_none() { "*" } else { "" };
+        let no_label_prefix = "";
         label_options.push(LabelOption {
             display: format!(
                 "{}{}",
