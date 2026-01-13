@@ -22,15 +22,12 @@ pub fn setup() {
     let subscriptions = match subscription::list_subscription() {
         Ok(list) => list,
         Err(err) => {
-            sub_bar.finish_with_message(format!("Failed to list subscriptions: {err}"));
+            sub_bar.finish_and_clear();
             eprintln!("Failed to list Azure subscriptions: {err}");
             return;
         }
     };
-    sub_bar.finish_with_message(format!(
-        "Fetched {} Azure subscriptions.",
-        subscriptions.len()
-    ));
+    sub_bar.finish_and_clear();
 
     if subscriptions.is_empty() {
         eprintln!("No Azure subscriptions available.");
@@ -56,26 +53,19 @@ pub fn setup() {
                 match appconfig::list_appconfig(&subscription.id) {
                     Ok(configs) => {
                         if configs.is_empty() {
-                            bar.finish_with_message(format!(
-                                "No App Configurations in subscription '{}'",
-                                subscription.name
-                            ));
+                            bar.finish_and_clear();
                             return;
                         }
 
-                        let count = configs.len();
-                        bar.finish_with_message(format!(
-                            "Fetched {} App Configurations for '{}'",
-                            count, subscription.name
-                        ));
-
+                        bar.finish_and_clear();
                         let _ = tx.send((subscription, configs));
                     }
                     Err(err) => {
-                        bar.finish_with_message(format!(
+                        bar.finish_and_clear();
+                        eprintln!(
                             "Failed to list App Configurations for '{}': {}",
                             subscription.name, err
-                        ));
+                        );
                     }
                 }
             });
