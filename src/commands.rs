@@ -189,10 +189,7 @@ pub mod app {
     use rustyline::validate::Validator;
     use rustyline::{Context, Editor, Helper};
 
-    use crate::azcli::{
-        error::AzCliResult,
-        run::az,
-    };
+    use crate::azcli::{error::AzCliResult, run::az, subscription};
 
     pub fn select_app() {
         let theme = ColorfulTheme::default();
@@ -215,6 +212,25 @@ pub mod app {
                 active.app.name.clone(),
                 active.app.label.clone(),
             )
+        };
+        let current_keyvault = {
+            let Some(active) = context.active.as_ref() else {
+                super::missing_setup_message();
+                return;
+            };
+
+            (
+                active.app.keyvault.clone(),
+                active.app.keyvault_subscription.clone(),
+            )
+        };
+
+        let subscriptions = match subscription::list_subscription() {
+            Ok(list) => list,
+            Err(err) => {
+                eprintln!("Failed to list subscriptions: {err}");
+                return;
+            }
         };
 
         let spinner = ProgressBar::new_spinner();
@@ -428,6 +444,18 @@ pub mod app {
             }
         };
 
+        let selected_keyvault = match select_keyvault(
+            &theme,
+            &subscriptions,
+            current_keyvault.clone(),
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!("Key Vault selection failed: {err}");
+                return;
+            }
+        };
+
         {
             let Some(active) = context.active.as_mut() else {
                 super::missing_setup_message();
@@ -436,11 +464,84 @@ pub mod app {
 
             active.app.name = Some(selected_app.clone());
             active.app.label = selected_label.clone();
-            active.app.keyvault = None;
+            active.app.keyvault = selected_keyvault.as_ref().map(|kv| kv.name.clone());
+            active.app.keyvault_subscription =
+                selected_keyvault.as_ref().map(|kv| kv.subscription_id.clone());
         }
 
         if !super::save_context(&store, &context) {
             return;
+        }
+    }
+
+    fn select_keyvault(
+        theme: &ColorfulTheme,
+        subscriptions: &[subscription::Subscription],
+        current: (Option<String>, Option<String>),
+    ) -> AzCliResult<Option<KeyVaultSelection>> {
+        let spinner = ProgressBar::new_spinner();
+        spinner.set_style(super::standard_spinner_style());
+        spinner.enable_steady_tick(Duration::from_millis(80));
+        spinner.set_message("Fetching Key Vaults...");
+
+        let vaults = fetch_keyvaults(subscriptions);
+        spinner.finish_and_clear();
+
+        let mut vaults = match vaults {
+            Ok(list) => list,
+            Err(err) => {
+                return Err(err);
+            }
+        };
+
+        if vaults.is_empty() {
+            println!("No Key Vaults found for your account.");
+            return Ok(None);
+        }
+
+        let mut sub_map = BTreeMap::new();
+        for sub in subscriptions {
+            sub_map.insert(sub.id.clone(), sub.name.clone());
+        }
+
+        vaults.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let items: Vec<String> = vaults
+            .iter()
+            .map(|kv| {
+                let sub_label = sub_map
+                    .get(&kv.subscription_id)
+                    .cloned()
+                    .unwrap_or_else(|| kv.subscription_id.clone());
+                format!("{} ({})", kv.name, sub_label.dimmed())
+            })
+            .collect();
+
+        let default_index = match (&current.0, &current.1) {
+            (Some(name), Some(sub_id)) => vaults
+                .iter()
+                .position(|kv| kv.name == *name && kv.subscription_id == *sub_id),
+            (Some(name), None) => vaults.iter().position(|kv| kv.name == *name),
+            _ => None,
+        }
+        .unwrap_or(0);
+
+        let selection = Select::with_theme(theme)
+            .with_prompt("Select the Key Vault for this application")
+            .items(&items)
+            .default(default_index.min(items.len().saturating_sub(1)))
+            .interact_opt();
+
+        match selection {
+            Ok(Some(idx)) => Ok(vaults.get(idx).cloned()),
+            Ok(None) => {
+                println!("Key Vault selection aborted.");
+                Ok(None)
+            }
+            Err(err) => Err(crate::azcli::error::AzCliError::CommandFailure {
+                code: None,
+                stderr: format!("{err}"),
+            }),
         }
     }
 
@@ -584,6 +685,12 @@ pub mod app {
         value: Option<String>,
     }
 
+    #[derive(Clone, Debug)]
+    struct KeyVaultSelection {
+        name: String,
+        subscription_id: String,
+    }
+
     fn fetch_all_keys(config_name: &str, subscription_id: &str) -> AzCliResult<Vec<KeyValue>> {
         az([
             "appconfig",
@@ -597,6 +704,52 @@ pub mod app {
             "-o",
             "json",
         ])
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct KeyVaultResource {
+        name: String,
+        id: String,
+    }
+
+    fn fetch_keyvaults(subscriptions: &[subscription::Subscription]) -> AzCliResult<Vec<KeyVaultSelection>> {
+        let mut vaults = Vec::new();
+
+        for sub in subscriptions {
+            let resources: Vec<KeyVaultResource> = az([
+                "resource",
+                "list",
+                "--resource-type",
+                "Microsoft.KeyVault/vaults",
+                "--subscription",
+                &sub.id,
+                "-o",
+                "json",
+            ])?;
+
+            for res in resources {
+                let sub_id = subscription_from_resource_id(&res.id).unwrap_or_else(|| sub.id.clone());
+                vaults.push(KeyVaultSelection {
+                    name: res.name,
+                    subscription_id: sub_id,
+                });
+            }
+        }
+
+        Ok(vaults)
+    }
+
+    fn subscription_from_resource_id(id: &str) -> Option<String> {
+        let marker = "/subscriptions/";
+        let start = id.find(marker)? + marker.len();
+        let rest = &id[start..];
+        let end = rest.find('/')?;
+        let sub = &rest[..end];
+        if sub.is_empty() {
+            None
+        } else {
+            Some(sub.to_string())
+        }
     }
 
     #[derive(Default)]

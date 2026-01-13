@@ -43,6 +43,8 @@ pub struct AppSelection {
     pub name: Option<String>,
     pub label: Option<String>,
     pub keyvault: Option<String>,
+    #[serde(default)]
+    pub keyvault_subscription: Option<String>,
 }
 
 impl Context {
