@@ -454,10 +454,7 @@ pub mod app {
 
                             return Some(trimmed.to_string());
                         }
-                        Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
-                            println!("Application creation aborted.");
-                            return None;
-                        }
+                        Err(ReadlineError::Interrupted | ReadlineError::Eof) => return None,
                         Err(err) => {
                             eprintln!("Application prompt failed: {err}");
                             return None;
