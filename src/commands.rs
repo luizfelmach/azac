@@ -183,13 +183,23 @@ struct ConfigOption {
 }
 
 pub mod app {
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::time::Duration;
+    use std::{
+        borrow::Cow,
+        collections::{BTreeMap, BTreeSet},
+        time::Duration,
+    };
 
-    use dialoguer::{theme::ColorfulTheme, Input, Select};
+    use dialoguer::{console::Term, theme::ColorfulTheme, Input, Select};
     use indicatif::ProgressBar;
     use owo_colors::OwoColorize;
     use serde::Deserialize;
+    use rustyline::completion::Completer;
+    use rustyline::error::ReadlineError;
+    use rustyline::highlight::Highlighter;
+    use rustyline::history::DefaultHistory;
+    use rustyline::hint::Hinter;
+    use rustyline::validate::Validator;
+    use rustyline::{Context, Editor, Helper};
 
     use crate::azcli::{
         error::AzCliResult,
@@ -303,21 +313,11 @@ pub mod app {
                 (name, true)
             }
             Ok(Some(_)) => {
-                let input = Input::with_theme(&theme)
-                    .with_prompt("Enter the new application prefix")
-                    .validate_with(|value: &String| {
-                        if value.trim().is_empty() {
-                            Err("Application name cannot be empty")
-                        } else {
-                            Ok(())
-                        }
-                    })
-                    .interact_text();
+                let input = prompt_new_application_prefix(&theme, &app_names);
 
                 match input {
-                    Ok(value) => (value.trim().to_string(), false),
-                    Err(err) => {
-                        eprintln!("Application creation failed: {err}");
+                    Some(value) => (value, false),
+                    None => {
                         return;
                     }
                 }
@@ -414,6 +414,139 @@ pub mod app {
                 "Using application '{}' (label: {}) under App Configuration '{}'.",
                 selected_app, label_display, config_name
             );
+        }
+    }
+
+    fn prompt_new_application_prefix(
+        theme: &ColorfulTheme,
+        existing_apps: &[String],
+    ) -> Option<String> {
+        if existing_apps.is_empty() {
+            return prompt_new_application_prefix_without_hints(theme);
+        }
+
+        match build_hinting_editor(existing_apps) {
+            Ok(mut editor) => {
+                let prompt_label = "Enter the new application prefix";
+                let prompt = format!(
+                    "{} {}: ",
+                    "?".yellow(),
+                    prompt_label.bold(),
+                );
+
+                loop {
+                    match editor.readline(&prompt) {
+                        Ok(value) => {
+                            let trimmed: &str = value.trim();
+                            if trimmed.is_empty() {
+                                eprintln!("Application name cannot be empty");
+                                continue;
+                            }
+
+                            let term = Term::stdout();
+                            let _ = term.clear_last_lines(1);
+                            println!(
+                                "{} {}: {}",
+                                "✔",
+                                prompt_label.bold(),
+                                trimmed.green()
+                            );
+
+                            return Some(trimmed.to_string());
+                        }
+                        Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
+                            println!("Application creation aborted.");
+                            return None;
+                        }
+                        Err(err) => {
+                            eprintln!("Application prompt failed: {err}");
+                            return None;
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "Interactive suggestion prompt unavailable ({err}). Falling back to basic input."
+                );
+                prompt_new_application_prefix_without_hints(theme)
+            }
+        }
+    }
+
+    fn prompt_new_application_prefix_without_hints(theme: &ColorfulTheme) -> Option<String> {
+        let input = Input::with_theme(theme)
+            .with_prompt("Enter the new application prefix")
+            .validate_with(|value: &String| {
+                if value.trim().is_empty() {
+                    Err("Application name cannot be empty")
+                } else {
+                    Ok(())
+                }
+            })
+            .interact_text();
+
+        match input {
+            Ok(value) => Some(value.trim().to_string()),
+            Err(err) => {
+                eprintln!("Application creation failed: {err}");
+                None
+            }
+        }
+    }
+
+    fn build_hinting_editor(
+        existing_apps: &[String],
+    ) -> rustyline::Result<Editor<AppNameHintHelper, DefaultHistory>> {
+        let mut editor = Editor::<AppNameHintHelper, DefaultHistory>::new()?;
+        editor.set_helper(Some(AppNameHintHelper::new(existing_apps)));
+        Ok(editor)
+    }
+
+    struct AppNameHintHelper {
+        suggestions: Vec<String>,
+    }
+
+    impl AppNameHintHelper {
+        fn new(existing_apps: &[String]) -> Self {
+            Self {
+                suggestions: existing_apps.to_vec(),
+            }
+        }
+    }
+
+    impl Completer for AppNameHintHelper {
+        type Candidate = String;
+    }
+
+    impl Helper for AppNameHintHelper {}
+
+    impl Highlighter for AppNameHintHelper {
+        fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+            Cow::Owned(format!("{}", hint.dimmed()))
+        }
+    }
+
+    impl Validator for AppNameHintHelper {}
+
+    impl Hinter for AppNameHintHelper {
+        type Hint = String;
+
+        fn hint(&self, line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<Self::Hint> {
+            if line.trim().is_empty() {
+                return self.suggestions.first().cloned();
+            }
+
+            self.suggestions
+                .iter()
+                .find(|candidate| candidate.starts_with(line))
+                .and_then(|candidate| {
+                    if candidate == &line {
+                        None
+                    } else {
+                        Some(candidate.strip_prefix(line).unwrap_or_default().to_string())
+                    }
+                })
         }
     }
 
