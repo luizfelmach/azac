@@ -180,6 +180,7 @@ pub mod app {
     use indicatif::ProgressBar;
     use owo_colors::OwoColorize;
     use serde::Deserialize;
+    use serde_json;
     use rustyline::completion::Completer;
     use rustyline::error::ReadlineError;
     use rustyline::highlight::Highlighter;
@@ -235,15 +236,18 @@ pub mod app {
 
         spinner.finish_and_clear();
 
-        let mut apps: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut apps: BTreeMap<String, AppStats> = BTreeMap::new();
         for entry in entries {
             if let Some(idx) = entry.key.rfind(&separator) {
                 let prefix = entry.key[..idx].to_string();
-                let labels = apps.entry(prefix).or_default();
+                let stats = apps.entry(prefix).or_insert_with(AppStats::default);
                 if let Some(label) = entry.label.as_deref().map(str::trim) {
                     if !label.is_empty() {
-                        labels.insert(label.to_string());
+                        stats.labels.insert(label.to_string());
                     }
+                }
+                if let Some(vault) = keyvault_name(&entry) {
+                    stats.keyvaults.insert(vault);
                 }
             }
         }
@@ -251,7 +255,10 @@ pub mod app {
         let creating_new_only = apps.is_empty();
 
         if let Some(current) = current_app.as_ref() {
-            apps.entry(current.clone()).or_insert_with(BTreeSet::new);
+            let stats = apps.entry(current.clone()).or_insert_with(AppStats::default);
+            if let Some(label) = current_label.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                stats.labels.insert(label.to_string());
+            }
         }
 
         let app_names: Vec<String> = apps.keys().cloned().collect();
@@ -259,25 +266,19 @@ pub mod app {
             .iter()
             .map(|name| {
                 let is_current = current_app.as_deref() == Some(name.as_str());
-                let labels = apps.get(name);
-                let label_text = match labels {
-                    Some(set) if !set.is_empty() => {
-                        let combined = set.iter().cloned().collect::<Vec<_>>().join(", ");
-                        format!("[{}]", combined)
-                    }
-                    _ => current_label
-                        .as_deref()
-                        .filter(|_| is_current)
-                        .map(|label| format!("[{}]", label))
-                        .unwrap_or_else(|| "- No Label".to_string()),
-                };
-
-                let label_display = format!("{}", label_text.as_str().dimmed());
+                let fallback = AppStats::default();
+                let stats = apps.get(name).unwrap_or(&fallback);
+                let label_display = format!(
+                    "{} labels and {} keyvault",
+                    stats.labels.len(),
+                    stats.keyvaults.len()
+                );
+                let label_display = format!("[{}]", label_display).dimmed().to_string();
                 let prefix = if is_current { "* " } else { "  " };
                 format!("{prefix}{} {}", name, label_display)
             })
             .collect();
-        display.push("+ Create new".to_string());
+        display.push(format!("{}", "+ Create new".truecolor(0, 120, 0)));
 
         let mut default_index = current_app
             .as_ref()
@@ -319,30 +320,74 @@ pub mod app {
             }
         };
 
-        let labels: Vec<String> = if selecting_existing {
+        #[derive(Clone)]
+        enum LabelChoice {
+            Existing(String),
+            NoneLabel,
+            CreateNew,
+        }
+
+        #[derive(Clone)]
+        struct LabelOption {
+            display: String,
+            choice: LabelChoice,
+        }
+
+        let mut labels: Vec<String> = if selecting_existing {
             apps.get(&selected_app)
-                .map(|set| set.iter().cloned().collect())
+                .map(|stats| stats.labels.iter().cloned().collect())
                 .unwrap_or_default()
         } else {
             Vec::new()
         };
 
-        let mut label_items = Vec::with_capacity(labels.len() + 2);
-        label_items.extend(labels.iter().cloned());
-        label_items.push("- No Label".to_string());
-        label_items.push("+ Create new".to_string());
+        // Ensure the current label (if any) is present so it can be shown consistently.
+        if selecting_existing {
+            if let Some(saved) = current_label.as_ref() {
+                if !labels.iter().any(|label| label == saved) {
+                    labels.insert(0, saved.clone());
+                }
+            }
+        }
 
-        let no_label_index = label_items.len().saturating_sub(2);
-        let create_new_index = label_items.len().saturating_sub(1);
+        let mut label_options = Vec::with_capacity(labels.len() + 2);
+        for label in labels.iter() {
+            let prefix = if current_label.as_deref() == Some(label.as_str()) {
+                "* "
+            } else {
+                "  "
+            };
+            label_options.push(LabelOption {
+                display: format!("{prefix}{label}"),
+                choice: LabelChoice::Existing(label.clone()),
+            });
+        }
 
-        let label_default = if selecting_existing && current_app.as_deref() == Some(selected_app.as_str()) {
-            current_label
-                .as_ref()
-                .and_then(|saved| labels.iter().position(|label| label == saved))
-                .unwrap_or(no_label_index)
-        } else {
-            no_label_index
-        };
+        let no_label_prefix = if current_label.is_none() { "*" } else { "" };
+        label_options.push(LabelOption {
+            display: format!(
+                "{}{}",
+                no_label_prefix,
+                format!("- No Label").truecolor(120, 0, 0)
+            ),
+            choice: LabelChoice::NoneLabel,
+        });
+        label_options.push(LabelOption {
+            display: format!("{}", "+ Create new".truecolor(0, 120, 0)),
+            choice: LabelChoice::CreateNew,
+        });
+
+        let label_default = label_options
+            .iter()
+            .enumerate()
+            .find_map(|(idx, opt)| match (&opt.choice, &current_label) {
+                (LabelChoice::Existing(lbl), Some(cur)) if lbl == cur => Some(idx),
+                (LabelChoice::NoneLabel, None) => Some(idx),
+                _ => None,
+            })
+            .unwrap_or_else(|| label_options.len().saturating_sub(2));
+
+        let label_items: Vec<String> = label_options.iter().map(|opt| opt.display.clone()).collect();
 
         let label_prompt = Select::with_theme(&theme)
             .with_prompt("Select the label for this application")
@@ -351,28 +396,33 @@ pub mod app {
             .interact_opt();
 
         let selected_label = match label_prompt {
-            Ok(Some(index)) if index == no_label_index => None,
-            Ok(Some(index)) if index == create_new_index => {
-                let input = Input::with_theme(&theme)
-                    .with_prompt("Enter the new label")
-                    .validate_with(|value: &String| {
-                        if value.trim().is_empty() {
-                            Err("Label cannot be empty")
-                        } else {
-                            Ok(())
-                        }
-                    })
-                    .interact_text();
+            Ok(Some(index)) => match label_options.get(index) {
+                Some(opt) => match &opt.choice {
+                    LabelChoice::Existing(label) => Some(label.clone()),
+                    LabelChoice::NoneLabel => None,
+                    LabelChoice::CreateNew => {
+                        let input = Input::with_theme(&theme)
+                            .with_prompt("Enter the new label")
+                            .validate_with(|value: &String| {
+                                if value.trim().is_empty() {
+                                    Err("Label cannot be empty")
+                                } else {
+                                    Ok(())
+                                }
+                            })
+                            .interact_text();
 
-                match input {
-                    Ok(value) => Some(value.trim().to_string()),
-                    Err(err) => {
-                        eprintln!("Label creation failed: {err}");
-                        return;
+                        match input {
+                            Ok(value) => Some(value.trim().to_string()),
+                            Err(err) => {
+                                eprintln!("Label creation failed: {err}");
+                                return;
+                            }
+                        }
                     }
-                }
-            }
-            Ok(Some(index)) => label_items.get(index).cloned(),
+                },
+                None => None,
+            },
             Ok(None) => {
                 println!("Label selection aborted.");
                 return;
@@ -534,6 +584,9 @@ pub mod app {
     struct KeyValue {
         key: String,
         label: Option<String>,
+        #[serde(rename = "contentType")]
+        content_type: Option<String>,
+        value: Option<String>,
     }
 
     fn fetch_all_keys(config_name: &str, subscription_id: &str) -> AzCliResult<Vec<KeyValue>> {
@@ -549,6 +602,79 @@ pub mod app {
             "-o",
             "json",
         ])
+    }
+
+    #[derive(Default)]
+    struct AppStats {
+        labels: BTreeSet<String>,
+        keyvaults: BTreeSet<String>,
+    }
+
+    fn keyvault_name(entry: &KeyValue) -> Option<String> {
+        if let Some(value) = entry.value.as_deref() {
+            if let Some(uri) = parse_keyvault_reference(value).or_else(|| parse_keyvault_json(value))
+            {
+                return vault_name_from_uri(&uri);
+            }
+        }
+
+        if entry
+            .content_type
+            .as_deref()
+            .map(|ct| ct.contains("keyvaultref"))
+            .unwrap_or(false)
+        {
+            if let Some(value) = entry.value.as_deref() {
+                if let Some(uri) = parse_keyvault_json(value) {
+                    return vault_name_from_uri(&uri);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn parse_keyvault_reference(value: &str) -> Option<String> {
+        const PREFIX: &str = "@Microsoft.KeyVault(SecretUri=";
+        const SUFFIX: &str = ")";
+
+        if value.starts_with(PREFIX) && value.ends_with(SUFFIX) {
+            let inner = &value[PREFIX.len()..value.len() - SUFFIX.len()];
+            if inner.is_empty() {
+                None
+            } else {
+                Some(inner.to_string())
+            }
+        } else {
+            None
+        }
+    }
+
+    fn parse_keyvault_json(value: &str) -> Option<String> {
+        let json: serde_json::Value = serde_json::from_str(value).ok()?;
+        json.get("uri")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                json.get("secretUri")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+    }
+
+    fn vault_name_from_uri(uri: &str) -> Option<String> {
+        let without_scheme = uri.splitn(2, "://").nth(1)?;
+        let host = without_scheme.split('/').next()?.trim();
+        if host.is_empty() {
+            return None;
+        }
+
+        let name = host.split('.').next().unwrap_or(host);
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        }
     }
 }
 
