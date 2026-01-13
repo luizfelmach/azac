@@ -1,6 +1,6 @@
 [package]
 name = "azac"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "better azure cli app configuration"
 license = "MIT"
