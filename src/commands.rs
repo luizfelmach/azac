@@ -160,10 +160,7 @@ pub fn setup() {
     context.active = Some(active);
 
     if save_context(&store, &context) {
-        println!(
-            "Using App Configuration '{}' in subscription '{}'.",
-            selected.config.name, selected.subscription.name
-        );
+        app::select_app();
     }
 }
 
@@ -292,7 +289,7 @@ pub mod app {
         }
 
         let selection = Select::with_theme(&theme)
-            .with_prompt("Select the application prefix:")
+            .with_prompt("Select the application prefix")
             .items(&display)
             .default(default_index.min(display.len().saturating_sub(1)))
             .interact_opt();
@@ -348,7 +345,7 @@ pub mod app {
         };
 
         let label_prompt = Select::with_theme(&theme)
-            .with_prompt("Select the label for this application:")
+            .with_prompt("Select the label for this application")
             .items(&label_items)
             .default(label_default.min(label_items.len().saturating_sub(1)))
             .interact_opt();
@@ -386,7 +383,7 @@ pub mod app {
             }
         };
 
-        let config_name = {
+        {
             let Some(active) = context.active.as_mut() else {
                 super::missing_setup_message();
                 return;
@@ -395,15 +392,10 @@ pub mod app {
             active.app.name = Some(selected_app.clone());
             active.app.label = selected_label.clone();
             active.app.keyvault = None;
-            active.config_name.clone()
-        };
+        }
 
-        if super::save_context(&store, &context) {
-            let label_display = selected_label.as_deref().unwrap_or("(none)");
-            println!(
-                "Using application '{}' (label: {}) under App Configuration '{}'.",
-                selected_app, label_display, config_name
-            );
+        if !super::save_context(&store, &context) {
+            return;
         }
     }
 
@@ -419,7 +411,7 @@ pub mod app {
             Ok(mut editor) => {
                 let prompt_label = "Enter the new application prefix";
                 let prompt = format!(
-                    "{} {}: ",
+                    "{} {} ",
                     "?".yellow(),
                     prompt_label.bold(),
                 );
@@ -436,9 +428,10 @@ pub mod app {
                             let term = Term::stdout();
                             let _ = term.clear_last_lines(1);
                             println!(
-                                "{} {}: {}",
+                                "{} {} {} {}",
                                 "✔",
                                 prompt_label.bold(),
+                                "·".dimmed(),
                                 trimmed.green()
                             );
 
@@ -1168,7 +1161,7 @@ pub mod kv {
         let app_name = active.app.name.clone();
 
         if require_app && app_name.is_none() {
-            eprintln!("No application selected. Run `azac app` to pick one.");
+            eprintln!("No application selected. Run `azac setup` to pick one.");
             return None;
         }
 

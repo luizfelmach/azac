@@ -3,7 +3,7 @@ mod commands;
 mod context;
 
 use clap::{Parser, Subcommand};
-use commands::{app, kv};
+use commands::kv;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -21,10 +21,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Configure the active App Configuration context
+    /// Configure the active App Configuration context and application
     Setup,
-    /// Select the active application inferred from the current App Configuration
-    App,
     /// List keys for the current App Configuration/App context
     #[command(alias = "ls")]
     List,
@@ -61,7 +59,6 @@ fn main() {
 
     match cli.command {
         Command::Setup => commands::setup(),
-        Command::App => app::select_app(),
         Command::List => kv::list_keys(),
         Command::Show { key } => kv::show_key(&key),
         Command::Set {
