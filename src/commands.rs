@@ -907,6 +907,7 @@ pub mod kv {
         Json,
         Yaml,
         Toml,
+        Env,
     }
 
     #[derive(Debug, Deserialize)]
@@ -937,6 +938,13 @@ pub mod kv {
         Plain,
         KeyVault,
         Prompt,
+    }
+
+    #[derive(Debug)]
+    struct PreparedExportEntry {
+        key: String,
+        value: String,
+        from_keyvault: bool,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1255,7 +1263,7 @@ pub mod kv {
 
         spinner.set_message("Preparing export payload...");
 
-        let mut map = serde_json::Map::new();
+        let mut prepared_entries = Vec::new();
         let mut total = 0usize;
         let mut keyvault_count = 0usize;
         let mut plain_count = 0usize;
@@ -1263,17 +1271,11 @@ pub mod kv {
         for entry in entries {
             let key = strip_prefix(&ctx, &entry.key);
             let (value, from_keyvault) = resolve_value(&entry, true, false);
-            let mut obj = serde_json::Map::new();
-            obj.insert(
-                "type".to_string(),
-                serde_json::Value::String(if from_keyvault {
-                    "keyvault".to_string()
-                } else {
-                    "plain".to_string()
-                }),
-            );
-            obj.insert("value".to_string(), serde_json::Value::String(value));
-            map.insert(key, serde_json::Value::Object(obj));
+            prepared_entries.push(PreparedExportEntry {
+                key,
+                value,
+                from_keyvault,
+            });
 
             total += 1;
             if from_keyvault {
@@ -1283,22 +1285,19 @@ pub mod kv {
             }
         }
 
-        let payload = serde_json::Value::Object(map);
-
         spinner.finish_with_message(format!(
             "Prepared {} entries (plain {}, keyvault {}).",
             total, plain_count, keyvault_count
         ));
 
         let serialized = match format {
-            ExportFormat::Json => serde_json::to_string_pretty(&payload)
+            ExportFormat::Json => serde_json::to_string_pretty(&build_export_payload(&prepared_entries))
                 .map_err(|err| format!("Failed to serialize JSON: {err}")),
-            ExportFormat::Yaml => {
-                serde_yaml::to_string(&payload).map_err(|err| format!("Failed to serialize YAML: {err}"))
-            }
-            ExportFormat::Toml => {
-                toml::to_string_pretty(&payload).map_err(|err| format!("Failed to serialize TOML: {err}"))
-            }
+            ExportFormat::Yaml => serde_yaml::to_string(&build_export_payload(&prepared_entries))
+                .map_err(|err| format!("Failed to serialize YAML: {err}")),
+            ExportFormat::Toml => toml::to_string_pretty(&build_export_payload(&prepared_entries))
+                .map_err(|err| format!("Failed to serialize TOML: {err}")),
+            ExportFormat::Env => Ok(serialize_env_entries(&prepared_entries)),
         };
 
         let data = match serialized {
@@ -1326,6 +1325,66 @@ pub mod kv {
                 total, plain_count, keyvault_count, format, file.display()
             );
         }
+    }
+
+    fn build_export_payload(entries: &[PreparedExportEntry]) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+
+        for entry in entries {
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "type".to_string(),
+                serde_json::Value::String(if entry.from_keyvault {
+                    "keyvault".to_string()
+                } else {
+                    "plain".to_string()
+                }),
+            );
+            obj.insert(
+                "value".to_string(),
+                serde_json::Value::String(entry.value.clone()),
+            );
+            map.insert(entry.key.clone(), serde_json::Value::Object(obj));
+        }
+
+        serde_json::Value::Object(map)
+    }
+
+    fn serialize_env_entries(entries: &[PreparedExportEntry]) -> String {
+        let mut lines = Vec::with_capacity(entries.len());
+
+        for entry in entries {
+            lines.push(format!(
+                "{}={}",
+                entry.key,
+                encode_env_value(&entry.value)
+            ));
+        }
+
+        let mut data = lines.join("\n");
+        if !data.is_empty() {
+            data.push('\n');
+        }
+        data
+    }
+
+    fn encode_env_value(value: &str) -> String {
+        if !needs_env_quotes(value) {
+            return value.to_string();
+        }
+
+        format!("\"{}\"", escape_double_quoted(value))
+    }
+
+    fn needs_env_quotes(value: &str) -> bool {
+        if value.is_empty() {
+            return true;
+        }
+
+        !value.chars().all(|ch| matches!(
+            ch,
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '.' | '-' | '/' | ':'
+        ))
     }
 
     pub fn import_entries(path: &Path) {
@@ -2136,6 +2195,23 @@ pub mod kv {
                 }
             } else {
                 result.push(ch);
+            }
+        }
+
+        result
+    }
+
+    fn escape_double_quoted(input: &str) -> String {
+        let mut result = String::with_capacity(input.len());
+
+        for ch in input.chars() {
+            match ch {
+                '\n' => result.push_str("\\n"),
+                '\r' => result.push_str("\\r"),
+                '\t' => result.push_str("\\t"),
+                '\\' => result.push_str("\\\\"),
+                '"' => result.push_str("\\\""),
+                _ => result.push(ch),
             }
         }
 
