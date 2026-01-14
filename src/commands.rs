@@ -783,18 +783,69 @@ pub mod app {
     }
 
     fn parse_keyvault_reference(value: &str) -> Option<String> {
-        const PREFIX: &str = "@Microsoft.KeyVault(SecretUri=";
+        const PREFIX: &str = "@Microsoft.KeyVault(";
         const SUFFIX: &str = ")";
 
-        if value.starts_with(PREFIX) && value.ends_with(SUFFIX) {
-            let inner = &value[PREFIX.len()..value.len() - SUFFIX.len()];
-            if inner.is_empty() {
-                None
-            } else {
-                Some(inner.to_string())
+        if !value.starts_with(PREFIX) || !value.ends_with(SUFFIX) {
+            return None;
+        }
+
+        let inner = &value[PREFIX.len()..value.len() - SUFFIX.len()];
+        let trimmed = inner.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let mut secret_uri = None;
+        let mut vault_name = None;
+        let mut secret_name = None;
+        let mut secret_version = None;
+
+        for part in trimmed.split(';') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
             }
-        } else {
-            None
+
+            let (key, value) = match part.split_once('=') {
+                Some((k, v)) => (k.trim().to_ascii_lowercase(), v.trim()),
+                None => continue,
+            };
+
+            if value.is_empty() {
+                continue;
+            }
+
+            match key.as_str() {
+                "secreturi" => secret_uri = Some(value.to_string()),
+                "vaultname" => vault_name = Some(value.to_string()),
+                "secretname" => secret_name = Some(value.to_string()),
+                "secretversion" => secret_version = Some(value.to_string()),
+                _ => {}
+            }
+        }
+
+        if let Some(uri) = secret_uri {
+            return Some(uri);
+        }
+
+        match (vault_name, secret_name) {
+            (Some(vault), Some(secret)) => {
+                let base = if vault.starts_with("http://") || vault.starts_with("https://") {
+                    vault.trim_end_matches('/').to_string()
+                } else {
+                    format!("https://{}.vault.azure.net", vault.trim_end_matches('/'))
+                };
+
+                let mut uri = format!("{}/secrets/{}", base, secret.trim_matches('/'));
+                if let Some(version) = secret_version.filter(|v| !v.trim().is_empty()) {
+                    uri.push('/');
+                    uri.push_str(version.trim_matches('/'));
+                }
+
+                Some(uri)
+            }
+            _ => None,
         }
     }
 
