@@ -1955,6 +1955,30 @@ pub mod kv {
 
     fn process_import_entry(ctx: &ActiveKvContext, entry: &ImportEntry) -> bool {
         let full_key = prefix_key(ctx, &entry.key);
+
+        if let Some(existing_entry) = show_entry(ctx, &full_key).ok() {
+            if let Some(secret_uri) = keyvault_uri_from_entry(&existing_entry) {
+                return match set_secret_value(&secret_uri, &entry.value) {
+                    Ok(_) => true,
+                    Err(err) => {
+                        eprintln!(
+                            "Failed to update Key Vault secret for '{}': {err}",
+                            entry.key
+                        );
+                        false
+                    }
+                };
+            }
+
+            return match write_entry(ctx, &full_key, &entry.value, None) {
+                Ok(_) => true,
+                Err(err) => {
+                    eprintln!("Failed to import '{}': {err}", entry.key);
+                    false
+                }
+            };
+        }
+
         let write_result = match entry.value_type {
             EntryValueType::KeyVault => match build_keyvault_reference(ctx, &full_key, &entry.value)
             {
