@@ -891,6 +891,7 @@ pub mod kv {
     };
 
     use clap::ValueEnum;
+    use crossterm::tty::IsTty;
     use dialoguer::{theme::ColorfulTheme, Select};
     use heck::ToUpperCamelCase;
     use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -1396,28 +1397,16 @@ pub mod kv {
             return;
         };
 
-        let mut prepared_entries = Vec::new();
-        let mut skipped = 0usize;
-
-        for mut entry in entries {
-            if entry.value_type == EntryValueType::Prompt {
-                match prompt_value_type(&entry.key) {
-                    Some(kind) => entry.value_type = kind,
-                    None => {
-                        println!("Skipping '{}' as requested.", entry.key);
-                        skipped += 1;
-                        continue;
-                    }
-                }
-            }
-
-            prepared_entries.push(entry);
-        }
+        let Some(preparation) = prepare_import_entries(entries) else {
+            return;
+        };
+        let prepared_entries = preparation.entries;
+        let skipped = preparation.skipped;
 
         if prepared_entries.is_empty() {
             if skipped > 0 {
                 println!(
-                    "No entries to import; skipped {} {} during prompting.",
+                    "No entries to import; skipped {} {} during selection.",
                     skipped,
                     if skipped == 1 { "entry" } else { "entries" }
                 );
@@ -1515,7 +1504,7 @@ pub mod kv {
         ));
         if skipped > 0 {
             println!(
-                "Skipped {} {} during prompting.",
+                "Skipped {} {} during selection.",
                 skipped,
                 if skipped == 1 { "entry" } else { "entries" }
             );
@@ -1847,11 +1836,16 @@ pub mod kv {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct ImportEntry {
         key: String,
         value: String,
         value_type: EntryValueType,
+    }
+
+    struct ImportPreparation {
+        entries: Vec<ImportEntry>,
+        skipped: usize,
     }
 
     fn parse_import_map(path: &Path) -> Option<Vec<ImportEntry>> {
@@ -1904,6 +1898,58 @@ pub mod kv {
             );
         }
         None
+    }
+
+    fn prepare_import_entries(entries: Vec<ImportEntry>) -> Option<ImportPreparation> {
+        if entries.is_empty() {
+            return Some(ImportPreparation {
+                entries,
+                skipped: 0,
+            });
+        }
+
+        if std::io::stdout().is_tty() {
+            match import_ui::review_entries(entries.clone()) {
+                Ok(Some(result)) => return Some(result),
+                Ok(None) => {
+                    println!("Import review canceled.");
+                    return None;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "Interactive import review failed: {}. Falling back to prompts.",
+                        err
+                    );
+                }
+            }
+        }
+
+        Some(legacy_prepare_entries(entries))
+    }
+
+    fn legacy_prepare_entries(entries: Vec<ImportEntry>) -> ImportPreparation {
+        let mut prepared_entries = Vec::new();
+        let mut skipped = 0usize;
+
+        for mut entry in entries {
+            if entry.value_type == EntryValueType::Prompt {
+                match prompt_value_type(&entry.key) {
+                    Some(kind) => entry.value_type = kind,
+                    None => {
+                        println!("Skipping '{}' as requested.", entry.key);
+                        skipped += 1;
+                        continue;
+                    }
+                }
+            }
+
+            prepared_entries.push(entry);
+        }
+
+        ImportPreparation {
+            entries: prepared_entries,
+            skipped,
+        }
     }
 
     fn format_detection_order(ext: &str, file_name: &str) -> Vec<ImportFormat> {
@@ -2262,6 +2308,350 @@ pub mod kv {
                 ImportFormat::Yaml => "YAML",
                 ImportFormat::Toml => "TOML",
                 ImportFormat::Env => ".env",
+            }
+        }
+    }
+
+    mod import_ui {
+        use super::{truncate_value, EntryValueType, ImportEntry, ImportPreparation};
+        use crossterm::{
+            event::{
+                self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+            },
+            execute,
+            terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+        };
+        use ratatui::{
+            backend::CrosstermBackend,
+            layout::{Constraint, Direction, Layout},
+            style::{Color, Modifier, Style},
+            text::{Line, Span, Text},
+            widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+            Frame, Terminal,
+        };
+        use std::{
+            io::{self, Stdout},
+            time::Duration,
+        };
+
+        const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+        pub(super) fn review_entries(
+            entries: Vec<ImportEntry>,
+        ) -> Result<Option<ImportPreparation>, String> {
+            if entries.is_empty() {
+                return Ok(Some(ImportPreparation {
+                    entries,
+                    skipped: 0,
+                }));
+            }
+
+            let mut session = TerminalSession::new()?;
+            let mut state = ReviewState::new(entries);
+
+            loop {
+                session.draw(&mut state)?;
+
+                if event::poll(POLL_INTERVAL).map_err(|err| err.to_string())? {
+                    match event::read().map_err(|err| err.to_string())? {
+                        Event::Key(key)
+                            if matches!(
+                                key.kind,
+                                KeyEventKind::Press | KeyEventKind::Repeat
+                            ) =>
+                        {
+                            match key.code {
+                                KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
+                                KeyCode::Char('j') | KeyCode::Down => state.next(),
+                                KeyCode::Char('k') | KeyCode::Up => state.previous(),
+                                KeyCode::Char('h') | KeyCode::Left => state.cycle_action(false),
+                                KeyCode::Char('l')
+                                | KeyCode::Right
+                                | KeyCode::Tab
+                                | KeyCode::Char(' ') => state.cycle_action(true),
+                                KeyCode::Enter => return Ok(Some(state.into_preparation())),
+                                _ => {}
+                            }
+                        }
+                        Event::Resize(_, _) => {}
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        struct TerminalSession {
+            terminal: Terminal<CrosstermBackend<Stdout>>,
+        }
+
+        impl TerminalSession {
+            fn new() -> Result<Self, String> {
+                enable_raw_mode().map_err(|err| err.to_string())?;
+                let mut stdout = io::stdout();
+                execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+                    .map_err(|err| err.to_string())?;
+                let backend = CrosstermBackend::new(stdout);
+                let mut terminal = Terminal::new(backend).map_err(|err| err.to_string())?;
+                terminal.hide_cursor().map_err(|err| err.to_string())?;
+                Ok(Self { terminal })
+            }
+
+            fn draw(&mut self, state: &mut ReviewState) -> Result<(), String> {
+                self.terminal
+                    .draw(|f| state.render(f))
+                    .map(|_| ())
+                    .map_err(|err| err.to_string())
+            }
+        }
+
+        impl Drop for TerminalSession {
+            fn drop(&mut self) {
+                let _ = disable_raw_mode();
+                let backend = self.terminal.backend_mut();
+                let _ = execute!(backend, LeaveAlternateScreen, DisableMouseCapture);
+                let _ = self.terminal.show_cursor();
+            }
+        }
+
+        struct ReviewState {
+            entries: Vec<UiEntry>,
+            list_state: ListState,
+        }
+
+        impl ReviewState {
+            fn new(entries: Vec<ImportEntry>) -> Self {
+                let items = entries.into_iter().map(UiEntry::from_entry).collect::<Vec<_>>();
+                let mut list_state = ListState::default();
+                if !items.is_empty() {
+                    list_state.select(Some(0));
+                }
+                Self {
+                    entries: items,
+                    list_state,
+                }
+            }
+
+            fn render(&mut self, f: &mut Frame<'_>) {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Percentage(65),
+                        Constraint::Percentage(25),
+                        Constraint::Length(5),
+                    ])
+                    .split(f.size());
+
+                let items = self
+                    .entries
+                    .iter()
+                    .map(|entry| entry.as_list_item())
+                    .collect::<Vec<_>>();
+
+                let list = List::new(items)
+                    .block(
+                        Block::default()
+                            .title("Entradas para importacao")
+                            .borders(Borders::ALL),
+                    )
+                    .highlight_symbol(">> ")
+                    .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+
+                f.render_stateful_widget(list, chunks[0], &mut self.list_state);
+
+                let details = Paragraph::new(build_details(self.selected_entry()))
+                    .block(Block::default().title("Detalhes").borders(Borders::ALL))
+                    .wrap(Wrap { trim: false });
+                f.render_widget(details, chunks[1]);
+
+                let instructions = Paragraph::new(
+                    "Use Up/Down para navegar - Left/Right ou Space para alternar - Enter confirma - q/Esc cancela",
+                )
+                .block(Block::default().title("Controles").borders(Borders::ALL))
+                .wrap(Wrap { trim: true });
+                f.render_widget(instructions, chunks[2]);
+            }
+
+            fn next(&mut self) {
+                let len = self.entries.len();
+                if len == 0 {
+                    return;
+                }
+                let current = self.list_state.selected().unwrap_or(0);
+                let next = if current + 1 >= len { 0 } else { current + 1 };
+                self.list_state.select(Some(next));
+            }
+
+            fn previous(&mut self) {
+                let len = self.entries.len();
+                if len == 0 {
+                    return;
+                }
+                let current = self.list_state.selected().unwrap_or(0);
+                let prev = if current == 0 { len - 1 } else { current - 1 };
+                self.list_state.select(Some(prev));
+            }
+
+            fn cycle_action(&mut self, forward: bool) {
+                if let Some(idx) = self.list_state.selected() {
+                    if let Some(entry) = self.entries.get_mut(idx) {
+                        if forward {
+                            entry.action = entry.action.next();
+                        } else {
+                            entry.action = entry.action.previous();
+                        }
+                    }
+                }
+            }
+
+            fn selected_entry(&self) -> Option<&UiEntry> {
+                self.list_state
+                    .selected()
+                    .and_then(|idx| self.entries.get(idx))
+            }
+
+            fn into_preparation(self) -> ImportPreparation {
+                let mut prepared = Vec::new();
+                let mut skipped = 0usize;
+
+                for mut entry in self.entries {
+                    match entry.action {
+                        EntryAction::Plain => {
+                            entry.entry.value_type = EntryValueType::Plain;
+                            prepared.push(entry.entry);
+                        }
+                        EntryAction::KeyVault => {
+                            entry.entry.value_type = EntryValueType::KeyVault;
+                            prepared.push(entry.entry);
+                        }
+                        EntryAction::Skip => skipped += 1,
+                    }
+                }
+
+                ImportPreparation {
+                    entries: prepared,
+                    skipped,
+                }
+            }
+        }
+
+        struct UiEntry {
+            entry: ImportEntry,
+            original: EntryValueType,
+            action: EntryAction,
+        }
+
+        impl UiEntry {
+            fn from_entry(entry: ImportEntry) -> Self {
+                let original = entry.value_type;
+                let action = EntryAction::from_entry_type(original);
+                Self {
+                    entry,
+                    original,
+                    action,
+                }
+            }
+
+            fn as_list_item(&self) -> ListItem<'static> {
+                let mut style = Style::default().fg(self.action.color());
+                if matches!(self.action, EntryAction::Skip) {
+                    style = style.add_modifier(Modifier::DIM);
+                }
+                if self.original == EntryValueType::Prompt {
+                    style = style.add_modifier(Modifier::ITALIC);
+                }
+
+                let preview = truncate_value(&self.entry.value, 40);
+                let spans = vec![
+                    Span::styled(self.action.short_label(), style),
+                    Span::raw(" "),
+                    Span::styled(
+                        self.entry.key.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(preview, Style::default().fg(Color::Gray)),
+                ];
+
+                ListItem::new(Line::from(spans)).style(style)
+            }
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum EntryAction {
+            Plain,
+            KeyVault,
+            Skip,
+        }
+
+        impl EntryAction {
+            fn from_entry_type(value_type: EntryValueType) -> Self {
+                match value_type {
+                    EntryValueType::Plain | EntryValueType::Prompt => EntryAction::Plain,
+                    EntryValueType::KeyVault => EntryAction::KeyVault,
+                }
+            }
+
+            fn next(self) -> Self {
+                match self {
+                    EntryAction::Plain => EntryAction::KeyVault,
+                    EntryAction::KeyVault => EntryAction::Skip,
+                    EntryAction::Skip => EntryAction::Plain,
+                }
+            }
+
+            fn previous(self) -> Self {
+                match self {
+                    EntryAction::Plain => EntryAction::Skip,
+                    EntryAction::KeyVault => EntryAction::Plain,
+                    EntryAction::Skip => EntryAction::KeyVault,
+                }
+            }
+
+            fn short_label(self) -> &'static str {
+                match self {
+                    EntryAction::Plain => "[plain]",
+                    EntryAction::KeyVault => "[keyvault]",
+                    EntryAction::Skip => "[skip]",
+                }
+            }
+
+            fn description(self) -> &'static str {
+                match self {
+                    EntryAction::Plain => "Salvar como valor simples",
+                    EntryAction::KeyVault => "Criar referencia no Key Vault",
+                    EntryAction::Skip => "Ignorar e nao importar",
+                }
+            }
+
+            fn color(self) -> Color {
+                match self {
+                    EntryAction::Plain => Color::Green,
+                    EntryAction::KeyVault => Color::Cyan,
+                    EntryAction::Skip => Color::DarkGray,
+                }
+            }
+        }
+
+        fn build_details(entry: Option<&UiEntry>) -> Text<'static> {
+            match entry {
+                Some(item) => {
+                    let mut lines = vec![
+                        Line::from(format!("Chave: {}", item.entry.key)),
+                        Line::from(format!("Acao: {}", item.action.description())),
+                        Line::from(format!(
+                            "Tipo original: {}",
+                            item.original.label()
+                        )),
+                        Line::from("Valor:"),
+                    ];
+
+                    for line in item.entry.value.lines() {
+                        lines.push(Line::from(line.to_string()));
+                    }
+
+                    Text::from(lines)
+                }
+                None => Text::from(Line::from("Nenhuma entrada selecionada.")),
             }
         }
     }
