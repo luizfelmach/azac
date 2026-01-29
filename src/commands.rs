@@ -2,7 +2,8 @@ use crate::{
     azcli::{appconfig, error::AzCliResult, run::az, subscription},
     cache::{CacheStore, CachedAppConfig, CachedKeyVault, SetupCache},
     context::{
-        default_separator, ActiveContext, AppSelection, Context, ContextStore, SubscriptionMetadata,
+        default_appconfig_endpoint, default_separator, ActiveContext, AppSelection, Context,
+        ContextStore, SubscriptionMetadata, DEFAULT_APP_CONFIG_ENDPOINT,
     },
 };
 use dialoguer::{theme::ColorfulTheme, Input, Select};
@@ -26,6 +27,7 @@ pub fn setup() {
             subscription_id: entry.subscription_id.clone(),
             subscription_name: entry.subscription_name.clone(),
             config_name: entry.name.clone(),
+            endpoint: normalize_appconfig_endpoint(&entry.name, &entry.endpoint),
         })
         .collect();
 
@@ -105,6 +107,7 @@ pub fn setup() {
             name: selected.subscription_name.clone(),
         },
         config_name: selected.config_name.clone(),
+        endpoint: selected.endpoint.clone(),
         separator,
         app: preserved_app,
     };
@@ -134,6 +137,7 @@ struct ConfigOption {
     subscription_id: String,
     subscription_name: String,
     config_name: String,
+    endpoint: String,
 }
 
 pub mod app {
@@ -169,15 +173,15 @@ pub mod app {
             None => return,
         };
 
-        let (subscription_id, config_name, separator, current_app, current_label) = {
+        let (config_name, endpoint, separator, current_app, current_label) = {
             let Some(active) = context.active.as_ref() else {
                 super::missing_setup_message();
                 return;
             };
 
             (
-                active.subscription.id.clone(),
                 active.config_name.clone(),
+                super::normalize_appconfig_endpoint(&active.config_name, &active.endpoint),
                 active.separator.clone(),
                 active.app.name.clone(),
                 active.app.label.clone(),
@@ -210,7 +214,7 @@ pub mod app {
             config_name
         ));
 
-        let entries = match fetch_all_keys(&config_name, &subscription_id) {
+        let entries = match fetch_all_keys(&endpoint) {
             Ok(entries) => entries,
             Err(err) => {
                 spinner.finish_and_clear();
@@ -655,15 +659,15 @@ pub mod app {
         subscription_id: String,
     }
 
-    fn fetch_all_keys(config_name: &str, subscription_id: &str) -> AzCliResult<Vec<KeyValue>> {
+    fn fetch_all_keys(endpoint: &str) -> AzCliResult<Vec<KeyValue>> {
         az([
             "appconfig",
             "kv",
             "list",
-            "--name",
-            config_name,
-            "--subscription",
-            subscription_id,
+            "--endpoint",
+            endpoint,
+            "--auth-mode",
+            "login",
             "--all",
             "-o",
             "json",
@@ -843,8 +847,8 @@ pub mod kv {
 
     #[derive(Debug)]
     struct ActiveKvContext {
-        subscription_id: String,
         config_name: String,
+        endpoint: String,
         separator: String,
         app_name: Option<String>,
         label: Option<String>,
@@ -1484,8 +1488,8 @@ pub mod kv {
             .filter(|kv| !kv.is_empty());
 
         Some(ActiveKvContext {
-            subscription_id: active.subscription.id.clone(),
             config_name: active.config_name.clone(),
+            endpoint: super::normalize_appconfig_endpoint(&active.config_name, &active.endpoint),
             separator: active.separator.clone(),
             app_name,
             label,
@@ -1498,10 +1502,10 @@ pub mod kv {
             "appconfig".to_string(),
             "kv".to_string(),
             "list".to_string(),
-            "--name".to_string(),
-            ctx.config_name.clone(),
-            "--subscription".to_string(),
-            ctx.subscription_id.clone(),
+            "--endpoint".to_string(),
+            ctx.endpoint.clone(),
+            "--auth-mode".to_string(),
+            "login".to_string(),
             "--all".to_string(),
             "-o".to_string(),
             "json".to_string(),
@@ -1526,10 +1530,10 @@ pub mod kv {
             "appconfig".to_string(),
             "kv".to_string(),
             "show".to_string(),
-            "--name".to_string(),
-            ctx.config_name.clone(),
-            "--subscription".to_string(),
-            ctx.subscription_id.clone(),
+            "--endpoint".to_string(),
+            ctx.endpoint.clone(),
+            "--auth-mode".to_string(),
+            "login".to_string(),
             "--key".to_string(),
             full_key.to_string(),
             "-o".to_string(),
@@ -1554,10 +1558,10 @@ pub mod kv {
             "appconfig".to_string(),
             "kv".to_string(),
             "set".to_string(),
-            "--name".to_string(),
-            ctx.config_name.clone(),
-            "--subscription".to_string(),
-            ctx.subscription_id.clone(),
+            "--endpoint".to_string(),
+            ctx.endpoint.clone(),
+            "--auth-mode".to_string(),
+            "login".to_string(),
             "--key".to_string(),
             full_key.to_string(),
             "--value".to_string(),
@@ -1589,10 +1593,10 @@ pub mod kv {
             "appconfig".to_string(),
             "kv".to_string(),
             "set-keyvault".to_string(),
-            "--name".to_string(),
-            ctx.config_name.clone(),
-            "--subscription".to_string(),
-            ctx.subscription_id.clone(),
+            "--endpoint".to_string(),
+            ctx.endpoint.clone(),
+            "--auth-mode".to_string(),
+            "login".to_string(),
             "--key".to_string(),
             full_key.to_string(),
             "--secret-identifier".to_string(),
@@ -1615,10 +1619,10 @@ pub mod kv {
             "appconfig".to_string(),
             "kv".to_string(),
             "delete".to_string(),
-            "--name".to_string(),
-            ctx.config_name.clone(),
-            "--subscription".to_string(),
-            ctx.subscription_id.clone(),
+            "--endpoint".to_string(),
+            ctx.endpoint.clone(),
+            "--auth-mode".to_string(),
+            "login".to_string(),
             "--key".to_string(),
             full_key.to_string(),
             "--yes".to_string(),
@@ -2427,10 +2431,12 @@ fn refresh_cache(store: CacheStore, kind: CacheRefreshKind) -> Option<SetupCache
 
     for (subscription, configs) in rx {
         for cfg in configs {
+            let endpoint = normalize_appconfig_endpoint(&cfg.name, &cfg.endpoint);
             cached_configs.push(CachedAppConfig {
                 subscription_id: subscription.id.clone(),
                 subscription_name: subscription.name.clone(),
                 name: cfg.name,
+                endpoint,
             });
         }
     }
@@ -2541,5 +2547,35 @@ fn subscription_from_resource_id(id: &str) -> Option<String> {
         None
     } else {
         Some(sub.to_string())
+    }
+}
+
+fn normalize_appconfig_endpoint(config_name: &str, endpoint: &str) -> String {
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        return derive_endpoint_from_name(config_name);
+    }
+
+    let normalized = trimmed.trim_end_matches('/');
+    if normalized.is_empty() {
+        return derive_endpoint_from_name(config_name);
+    }
+
+    if normalized == DEFAULT_APP_CONFIG_ENDPOINT {
+        let derived = derive_endpoint_from_name(config_name);
+        if derived != DEFAULT_APP_CONFIG_ENDPOINT {
+            return derived;
+        }
+    }
+
+    normalized.to_string()
+}
+
+fn derive_endpoint_from_name(config_name: &str) -> String {
+    let trimmed_name = config_name.trim();
+    if trimmed_name.is_empty() {
+        default_appconfig_endpoint()
+    } else {
+        format!("https://{}.azconfig.io", trimmed_name)
     }
 }

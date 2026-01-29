@@ -1,4 +1,4 @@
-use crate::azcli::subscription;
+use crate::{azcli::subscription, context::default_appconfig_endpoint};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
@@ -64,6 +64,8 @@ pub struct CachedAppConfig {
     pub subscription_id: String,
     pub subscription_name: String,
     pub name: String,
+    #[serde(default = "default_appconfig_endpoint")]
+    pub endpoint: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

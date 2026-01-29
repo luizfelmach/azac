@@ -4,6 +4,7 @@ use std::{fs, path::PathBuf};
 use thiserror::Error;
 
 const DEFAULT_SEPARATOR: &str = ":";
+pub const DEFAULT_APP_CONFIG_ENDPOINT: &str = "https://hml-miltech-appconfig.azconfig.io";
 
 #[derive(Debug, Error)]
 pub enum ContextError {
@@ -26,6 +27,8 @@ pub struct Context {
 pub struct ActiveContext {
     pub subscription: SubscriptionMetadata,
     pub config_name: String,
+    #[serde(default = "default_appconfig_endpoint")]
+    pub endpoint: String,
     #[serde(default = "default_separator")]
     pub separator: String,
     #[serde(default)]
@@ -91,4 +94,8 @@ fn project_dirs() -> Option<ProjectDirs> {
 
 pub fn default_separator() -> String {
     DEFAULT_SEPARATOR.to_string()
+}
+
+pub fn default_appconfig_endpoint() -> String {
+    DEFAULT_APP_CONFIG_ENDPOINT.to_string()
 }
