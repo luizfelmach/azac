@@ -2166,7 +2166,6 @@ fn ensure_cache_ready() -> Option<SetupCache> {
         return Some(cache);
     }
 
-    println!("Azure metadata cache is empty. Running an initial sync...");
     refresh_cache(store, CacheRefreshKind::Auto)
 }
 
@@ -2323,14 +2322,14 @@ enum CacheRefreshKind {
 impl CacheRefreshKind {
     fn start_message(&self) -> Option<&'static str> {
         match self {
-            CacheRefreshKind::Manual => Some("Refreshing Azure metadata cache..."),
-            CacheRefreshKind::Auto => Some("Priming Azure metadata cache..."),
+            CacheRefreshKind::Manual => None,
+            CacheRefreshKind::Auto => None,
         }
     }
 
     fn success_message(&self) -> Option<&'static str> {
         match self {
-            CacheRefreshKind::Manual => Some("Azure metadata cache refreshed."),
+            CacheRefreshKind::Manual => None,
             CacheRefreshKind::Auto => None,
         }
     }
