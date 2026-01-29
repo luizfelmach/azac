@@ -1,4 +1,5 @@
 mod azcli;
+mod cache;
 mod commands;
 mod context;
 
@@ -52,6 +53,8 @@ enum Command {
     Promote { key: String },
     /// Demote a Key Vault reference to a plain value
     Demote { key: String },
+    /// Refresh cached Azure metadata used during setup
+    Sync,
 }
 
 fn main() {
@@ -71,5 +74,6 @@ fn main() {
         Command::Delete { keys } => kv::delete_keys(&keys),
         Command::Export { format, file } => kv::export_entries(format, &file),
         Command::Import { file } => kv::import_entries(&file),
+        Command::Sync => commands::sync(),
     }
 }

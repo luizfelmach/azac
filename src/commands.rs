@@ -1,5 +1,6 @@
 use crate::{
-    azcli::{appconfig, subscription},
+    azcli::{appconfig, error::AzCliResult, run::az, subscription},
+    cache::{CacheStore, CachedAppConfig, CachedKeyVault, SetupCache},
     context::{
         default_separator, ActiveContext, AppSelection, Context, ContextStore, SubscriptionMetadata,
     },
@@ -7,92 +8,43 @@ use crate::{
 use dialoguer::{theme::ColorfulTheme, Input, Select};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
+use serde::Deserialize;
 use std::{sync::mpsc, thread, time::Duration};
 
 pub fn setup() {
     let theme = ColorfulTheme::default();
-    let spinner_style = standard_spinner_style();
-    let multi = MultiProgress::new();
 
-    let sub_bar = multi.add(ProgressBar::new_spinner());
-    sub_bar.set_style(spinner_style.clone());
-    sub_bar.set_message("Fetching Azure subscriptions...");
-    sub_bar.enable_steady_tick(Duration::from_millis(80));
-
-    let subscriptions = match subscription::list_subscription() {
-        Ok(list) => list,
-        Err(err) => {
-            sub_bar.finish_and_clear();
-            eprintln!("Failed to list Azure subscriptions: {err}");
-            return;
-        }
+    let cache = match ensure_cache_ready() {
+        Some(cache) => cache,
+        None => return,
     };
-    sub_bar.finish_and_clear();
 
-    if subscriptions.is_empty() {
-        eprintln!("No Azure subscriptions available.");
-        return;
-    }
-
-    let mut options = Vec::new();
-    let (tx, rx) = mpsc::channel();
-
-    thread::scope(|scope| {
-        for subscription in subscriptions.iter().cloned() {
-            let bar = multi.add(ProgressBar::new_spinner());
-            bar.set_style(spinner_style.clone());
-            let tx = tx.clone();
-
-            scope.spawn(move || {
-                bar.enable_steady_tick(Duration::from_millis(80));
-                bar.set_message(format!(
-                    "Fetching App Configurations for '{}'",
-                    subscription.name
-                ));
-
-                match appconfig::list_appconfig(&subscription.id) {
-                    Ok(configs) => {
-                        if configs.is_empty() {
-                            bar.finish_and_clear();
-                            return;
-                        }
-
-                        bar.finish_and_clear();
-                        let _ = tx.send((subscription, configs));
-                    }
-                    Err(err) => {
-                        bar.finish_and_clear();
-                        eprintln!(
-                            "Failed to list App Configurations for '{}': {}",
-                            subscription.name, err
-                        );
-                    }
-                }
-            });
-        }
-    });
-
-    drop(tx);
-
-    for (subscription, configs) in rx {
-        for cfg in configs {
-            options.push(ConfigOption {
-                subscription: subscription.clone(),
-                config: cfg,
-            });
-        }
-    }
+    let mut options: Vec<ConfigOption> = cache
+        .appconfigs
+        .iter()
+        .map(|entry| ConfigOption {
+            subscription_id: entry.subscription_id.clone(),
+            subscription_name: entry.subscription_name.clone(),
+            config_name: entry.name.clone(),
+        })
+        .collect();
 
     if options.is_empty() {
         eprintln!("No App Configuration instances were found across your subscriptions.");
         return;
     }
 
+    options.sort_by(|a, b| {
+        a.config_name
+            .cmp(&b.config_name)
+            .then_with(|| a.subscription_name.cmp(&b.subscription_name))
+    });
+
     let labels: Vec<String> = options
         .iter()
         .map(|option| {
-            let sub = format!("({})", option.subscription.name);
-            format!("{} {}", option.config.name, sub.dimmed())
+            let sub = format!("({})", option.subscription_name);
+            format!("{} {}", option.config_name, sub.dimmed())
         })
         .collect();
 
@@ -140,8 +92,8 @@ pub fn setup() {
     let mut preserved_app = AppSelection::default();
 
     if let Some(existing) = context.active.take() {
-        if existing.subscription.id == selected.subscription.id
-            && existing.config_name == selected.config.name
+        if existing.subscription.id == selected.subscription_id
+            && existing.config_name == selected.config_name
         {
             preserved_app = existing.app;
         }
@@ -149,10 +101,10 @@ pub fn setup() {
 
     let active = ActiveContext {
         subscription: SubscriptionMetadata {
-            id: selected.subscription.id.clone(),
-            name: selected.subscription.name.clone(),
+            id: selected.subscription_id.clone(),
+            name: selected.subscription_name.clone(),
         },
-        config_name: selected.config.name.clone(),
+        config_name: selected.config_name.clone(),
         separator,
         app: preserved_app,
     };
@@ -164,9 +116,24 @@ pub fn setup() {
     }
 }
 
+pub fn sync() {
+    let store = match CacheStore::new() {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!("Failed to locate cache store: {err}");
+            return;
+        }
+    };
+
+    if refresh_cache(store, CacheRefreshKind::Manual).is_none() {
+        eprintln!("Unable to refresh Azure metadata cache.");
+    }
+}
+
 struct ConfigOption {
-    subscription: subscription::Subscription,
-    config: appconfig::AppConfig,
+    subscription_id: String,
+    subscription_name: String,
+    config_name: String,
 }
 
 pub mod app {
@@ -189,7 +156,10 @@ pub mod app {
     use rustyline::validate::Validator;
     use rustyline::{Context, Editor, Helper};
 
-    use crate::azcli::{error::AzCliResult, run::az, subscription};
+    use crate::{
+        azcli::{error::AzCliResult, run::az, subscription},
+        cache::CachedKeyVault,
+    };
 
     pub fn select_app() {
         let theme = ColorfulTheme::default();
@@ -225,13 +195,12 @@ pub mod app {
             )
         };
 
-        let subscriptions = match subscription::list_subscription() {
-            Ok(list) => list,
-            Err(err) => {
-                eprintln!("Failed to list subscriptions: {err}");
-                return;
-            }
+        let cache = match super::ensure_cache_ready() {
+            Some(cache) => cache,
+            None => return,
         };
+        let subscriptions = cache.subscriptions;
+        let cached_keyvaults = cache.keyvaults;
 
         let spinner = ProgressBar::new_spinner();
         spinner.set_style(super::standard_spinner_style());
@@ -447,6 +416,7 @@ pub mod app {
         let selected_keyvault = match select_keyvault(
             &theme,
             &subscriptions,
+            &cached_keyvaults,
             current_keyvault.clone(),
         ) {
             Ok(value) => value,
@@ -477,27 +447,21 @@ pub mod app {
     fn select_keyvault(
         theme: &ColorfulTheme,
         subscriptions: &[subscription::Subscription],
+        keyvaults: &[CachedKeyVault],
         current: (Option<String>, Option<String>),
     ) -> AzCliResult<Option<KeyVaultSelection>> {
-        let spinner = ProgressBar::new_spinner();
-        spinner.set_style(super::standard_spinner_style());
-        spinner.enable_steady_tick(Duration::from_millis(80));
-        spinner.set_message("Fetching Key Vaults...");
-
-        let vaults = fetch_keyvaults(subscriptions);
-        spinner.finish_and_clear();
-
-        let mut vaults = match vaults {
-            Ok(list) => list,
-            Err(err) => {
-                return Err(err);
-            }
-        };
-
-        if vaults.is_empty() {
+        if keyvaults.is_empty() {
             println!("No Key Vaults found for your account.");
             return Ok(None);
         }
+
+        let mut vaults: Vec<KeyVaultSelection> = keyvaults
+            .iter()
+            .map(|kv| KeyVaultSelection {
+                name: kv.name.clone(),
+                subscription_id: kv.subscription_id.clone(),
+            })
+            .collect();
 
         let mut sub_map = BTreeMap::new();
         for sub in subscriptions {
@@ -704,52 +668,6 @@ pub mod app {
             "-o",
             "json",
         ])
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct KeyVaultResource {
-        name: String,
-        id: String,
-    }
-
-    fn fetch_keyvaults(subscriptions: &[subscription::Subscription]) -> AzCliResult<Vec<KeyVaultSelection>> {
-        let mut vaults = Vec::new();
-
-        for sub in subscriptions {
-            let resources: Vec<KeyVaultResource> = az([
-                "resource",
-                "list",
-                "--resource-type",
-                "Microsoft.KeyVault/vaults",
-                "--subscription",
-                &sub.id,
-                "-o",
-                "json",
-            ])?;
-
-            for res in resources {
-                let sub_id = subscription_from_resource_id(&res.id).unwrap_or_else(|| sub.id.clone());
-                vaults.push(KeyVaultSelection {
-                    name: res.name,
-                    subscription_id: sub_id,
-                });
-            }
-        }
-
-        Ok(vaults)
-    }
-
-    fn subscription_from_resource_id(id: &str) -> Option<String> {
-        let marker = "/subscriptions/";
-        let start = id.find(marker)? + marker.len();
-        let rest = &id[start..];
-        let end = rest.find('/')?;
-        let sub = &rest[..end];
-        if sub.is_empty() {
-            None
-        } else {
-            Some(sub.to_string())
-        }
     }
 
     #[derive(Default)]
@@ -2397,4 +2315,231 @@ fn missing_setup_message() {
 fn standard_spinner_style() -> ProgressStyle {
     ProgressStyle::with_template("{spinner:.green} {msg}")
         .unwrap_or_else(|_| ProgressStyle::default_spinner())
+}
+
+fn ensure_cache_ready() -> Option<SetupCache> {
+    let (store, cache) = match load_cache_state() {
+        Some(value) => value,
+        None => return None,
+    };
+
+    if cache.is_ready() {
+        return Some(cache);
+    }
+
+    println!("Azure metadata cache is empty. Running an initial sync...");
+    refresh_cache(store, CacheRefreshKind::Auto)
+}
+
+fn load_cache_state() -> Option<(CacheStore, SetupCache)> {
+    let store = match CacheStore::new() {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!("Failed to locate cache store: {err}");
+            return None;
+        }
+    };
+
+    let cache = match SetupCache::load_or_default(&store) {
+        Ok(cache) => cache,
+        Err(err) => {
+            eprintln!("Failed to load cache: {err}");
+            return None;
+        }
+    };
+
+    Some((store, cache))
+}
+
+fn save_cache(store: &CacheStore, cache: &SetupCache) -> bool {
+    match cache.save(store) {
+        Ok(_) => true,
+        Err(err) => {
+            eprintln!("Failed to save cache: {err}");
+            false
+        }
+    }
+}
+
+fn refresh_cache(store: CacheStore, kind: CacheRefreshKind) -> Option<SetupCache> {
+    if let Some(msg) = kind.start_message() {
+        println!("{msg}");
+    }
+
+    let spinner_style = standard_spinner_style();
+    let multi = MultiProgress::new();
+
+    let sub_bar = multi.add(ProgressBar::new_spinner());
+    sub_bar.set_style(spinner_style.clone());
+    sub_bar.set_message("Fetching Azure subscriptions...");
+    sub_bar.enable_steady_tick(Duration::from_millis(80));
+
+    let subscriptions = match subscription::list_subscription() {
+        Ok(list) => list,
+        Err(err) => {
+            sub_bar.finish_and_clear();
+            eprintln!("Failed to list Azure subscriptions: {err}");
+            return None;
+        }
+    };
+    sub_bar.finish_and_clear();
+
+    if subscriptions.is_empty() {
+        eprintln!("No Azure subscriptions available.");
+        return None;
+    }
+
+    let (tx, rx) = mpsc::channel();
+
+    thread::scope(|scope| {
+        for subscription in subscriptions.iter().cloned() {
+            let bar = multi.add(ProgressBar::new_spinner());
+            bar.set_style(spinner_style.clone());
+            let tx = tx.clone();
+
+            scope.spawn(move || {
+                bar.enable_steady_tick(Duration::from_millis(80));
+                bar.set_message(format!(
+                    "Fetching App Configurations for '{}'",
+                    subscription.name
+                ));
+
+                match appconfig::list_appconfig(&subscription.id) {
+                    Ok(configs) => {
+                        bar.finish_and_clear();
+                        let _ = tx.send((subscription, configs));
+                    }
+                    Err(err) => {
+                        bar.finish_and_clear();
+                        eprintln!(
+                            "Failed to list App Configurations for '{}': {}",
+                            subscription.name, err
+                        );
+                    }
+                }
+            });
+        }
+    });
+
+    drop(tx);
+
+    let mut cached_configs = Vec::new();
+
+    for (subscription, configs) in rx {
+        for cfg in configs {
+            cached_configs.push(CachedAppConfig {
+                subscription_id: subscription.id.clone(),
+                subscription_name: subscription.name.clone(),
+                name: cfg.name,
+            });
+        }
+    }
+
+    if cached_configs.is_empty() {
+        eprintln!("No App Configuration instances were found across your subscriptions.");
+        return None;
+    }
+
+    let kv_spinner = ProgressBar::new_spinner();
+    kv_spinner.set_style(spinner_style.clone());
+    kv_spinner.enable_steady_tick(Duration::from_millis(80));
+    kv_spinner.set_message("Fetching Key Vaults...");
+
+    let keyvaults = match fetch_keyvault_inventory(&subscriptions) {
+        Ok(vaults) => vaults,
+        Err(err) => {
+            kv_spinner.finish_and_clear();
+            eprintln!("Failed to list Key Vaults: {err}");
+            return None;
+        }
+    };
+
+    kv_spinner.finish_and_clear();
+
+    let cache = SetupCache {
+        subscriptions,
+        appconfigs: cached_configs,
+        keyvaults,
+        ready: true,
+    };
+
+    if !save_cache(&store, &cache) {
+        return None;
+    }
+
+    if let Some(msg) = kind.success_message() {
+        println!("{msg}");
+    }
+
+    Some(cache)
+}
+
+enum CacheRefreshKind {
+    Manual,
+    Auto,
+}
+
+impl CacheRefreshKind {
+    fn start_message(&self) -> Option<&'static str> {
+        match self {
+            CacheRefreshKind::Manual => Some("Refreshing Azure metadata cache..."),
+            CacheRefreshKind::Auto => Some("Priming Azure metadata cache..."),
+        }
+    }
+
+    fn success_message(&self) -> Option<&'static str> {
+        match self {
+            CacheRefreshKind::Manual => Some("Azure metadata cache refreshed."),
+            CacheRefreshKind::Auto => None,
+        }
+    }
+}
+
+fn fetch_keyvault_inventory(
+    subscriptions: &[subscription::Subscription],
+) -> AzCliResult<Vec<CachedKeyVault>> {
+    #[derive(Debug, Deserialize)]
+    struct KeyVaultResource {
+        name: String,
+        id: String,
+    }
+
+    let mut vaults = Vec::new();
+
+    for sub in subscriptions {
+        let resources: Vec<KeyVaultResource> = az([
+            "resource",
+            "list",
+            "--resource-type",
+            "Microsoft.KeyVault/vaults",
+            "--subscription",
+            &sub.id,
+            "-o",
+            "json",
+        ])?;
+
+        for res in resources {
+            let sub_id =
+                subscription_from_resource_id(&res.id).unwrap_or_else(|| sub.id.clone());
+            vaults.push(CachedKeyVault {
+                name: res.name,
+                subscription_id: sub_id,
+            });
+        }
+    }
+
+    Ok(vaults)
+}
+
+fn subscription_from_resource_id(id: &str) -> Option<String> {
+    let marker = "/subscriptions/";
+    let start = id.find(marker)? + marker.len();
+    let rest = &id[start..];
+    let end = rest.find('/')?;
+    let sub = &rest[..end];
+    if sub.is_empty() {
+        None
+    } else {
+        Some(sub.to_string())
+    }
 }

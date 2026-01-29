@@ -1,7 +1,7 @@
 use super::{error::AzCliResult, run::az};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Subscription {
     pub id: String,
     pub name: String,
