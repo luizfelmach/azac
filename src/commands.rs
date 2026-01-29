@@ -6,15 +6,13 @@ use crate::{
         ContextStore, SubscriptionMetadata, DEFAULT_APP_CONFIG_ENDPOINT,
     },
 };
-use dialoguer::{theme::ColorfulTheme, Input, Select};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use inquire::{InquireError, Select, Text};
 use owo_colors::OwoColorize;
 use serde::Deserialize;
-use std::{sync::mpsc, thread, time::Duration};
+use std::{fmt, sync::mpsc, thread, time::Duration};
 
 pub fn setup() {
-    let theme = ColorfulTheme::default();
-
     let cache = match ensure_cache_ready() {
         Some(cache) => cache,
         None => return,
@@ -42,26 +40,23 @@ pub fn setup() {
             .then_with(|| a.subscription_name.cmp(&b.subscription_name))
     });
 
-    let labels: Vec<String> = options
+    let select_options: Vec<MenuItem<usize>> = options
         .iter()
-        .map(|option| {
-            let sub = format!("({})", option.subscription_name);
-            format!("{} {}", option.config_name, sub.dimmed())
+        .enumerate()
+        .map(|(index, option)| {
+            let sub = option.subscription_name.dimmed().to_string();
+            let label = format!("{} ({})", option.config_name, sub);
+            MenuItem::new(index, label)
         })
         .collect();
 
-    let selection = Select::with_theme(&theme)
-        .with_prompt("Select the App Configuration to use")
-        .items(&labels)
-        .default(0)
-        .interact_opt();
+    let selection = Select::new("App Configuration", select_options)
+        .with_starting_cursor(0)
+        .prompt();
 
     let selected = match selection {
-        Ok(Some(index)) => &options[index],
-        Ok(None) => {
-            println!("Setup aborted.");
-            return;
-        }
+        Ok(choice) => &options[choice.value],
+        Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => return,
         Err(err) => {
             eprintln!("Selection failed: {err}");
             return;
@@ -69,12 +64,12 @@ pub fn setup() {
     };
 
     let default_sep = default_separator();
-    let separator_input: String = match Input::with_theme(&theme)
-        .with_prompt("Key separator")
-        .default(default_sep.clone())
-        .interact_text()
+    let separator_input: String = match Text::new("Key Separator")
+        .with_default(&default_sep)
+        .prompt()
     {
         Ok(value) => value.trim().to_string(),
+        Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => return,
         Err(err) => {
             eprintln!("Separator prompt failed: {err}");
             return;
@@ -140,34 +135,43 @@ struct ConfigOption {
     endpoint: String,
 }
 
-pub mod app {
-    use std::{
-        borrow::Cow,
-        collections::{BTreeMap, BTreeSet},
-        time::Duration,
-    };
+#[derive(Clone)]
+struct MenuItem<T> {
+    value: T,
+    label: String,
+}
 
-    use dialoguer::{console::Term, theme::ColorfulTheme, Input, Select};
+impl<T> MenuItem<T> {
+    fn new(value: T, label: String) -> Self {
+        Self { value, label }
+    }
+}
+
+impl<T> fmt::Display for MenuItem<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.label)
+    }
+}
+
+pub mod app {
+    use std::{collections::{BTreeMap, BTreeSet}, time::Duration};
+
+    use inquire::{
+        autocompletion::Replacement, Autocomplete, CustomUserError, InquireError, Select, Text,
+        validator::Validation,
+    };
     use indicatif::ProgressBar;
     use owo_colors::OwoColorize;
     use serde::Deserialize;
     use serde_json;
-    use rustyline::completion::Completer;
-    use rustyline::error::ReadlineError;
-    use rustyline::highlight::Highlighter;
-    use rustyline::history::DefaultHistory;
-    use rustyline::hint::Hinter;
-    use rustyline::validate::Validator;
-    use rustyline::{Context, Editor, Helper};
 
     use crate::{
         azcli::{error::AzCliResult, run::az, subscription},
         cache::CachedKeyVault,
     };
+    use super::MenuItem;
 
     pub fn select_app() {
-        let theme = ColorfulTheme::default();
-
         let (store, mut context) = match super::load_context() {
             Some(value) => value,
             None => return,
@@ -241,8 +245,6 @@ pub mod app {
             }
         }
 
-        let creating_new_only = apps.is_empty();
-
         if let Some(current) = current_app.as_ref() {
             let stats = apps.entry(current.clone()).or_insert_with(AppStats::default);
             if let Some(label) = current_label.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
@@ -251,174 +253,45 @@ pub mod app {
         }
 
         let app_names: Vec<String> = apps.keys().cloned().collect();
-        let mut display: Vec<String> = app_names
-            .iter()
-            .map(|name| {
-                let is_current = current_app.as_deref() == Some(name.as_str());
-                let fallback = AppStats::default();
-                let stats = apps.get(name).unwrap_or(&fallback);
-                let label_display = format!(
-                    "{} labels and {} keyvault",
-                    stats.labels.len(),
-                    stats.keyvaults.len()
-                );
-                let label_display = format!("[{}]", label_display).dimmed().to_string();
-                let prefix = if is_current { "* " } else { "  " };
-                format!("{prefix}{} {}", name, label_display)
-            })
-            .collect();
-        display.push(format!("{}", "+ Create new".truecolor(0, 120, 0)));
 
-        let mut default_index = current_app
-            .as_ref()
-            .and_then(|current| app_names.iter().position(|name| name == current))
-            .unwrap_or(0);
-
-        if creating_new_only {
-            default_index = display.len() - 1;
-        }
-
-        let selection = Select::with_theme(&theme)
-            .with_prompt("Select the application prefix")
-            .items(&display)
-            .default(default_index.min(display.len().saturating_sub(1)))
-            .interact_opt();
-
-        let (selected_app, selecting_existing) = match selection {
-            Ok(Some(index)) if index < app_names.len() => {
-                let name = app_names[index].clone();
-                (name, true)
+        let app_prompt = Text::new("Application")
+        .with_autocomplete(ValueAutocomplete::new(&app_names))
+        .with_validator(|value: &str| {
+            if value.trim().is_empty() {
+                Ok(Validation::Invalid("Application name cannot be empty".into()))
+            } else {
+                Ok(Validation::Valid)
             }
-            Ok(Some(_)) => {
-                let input = prompt_new_application_prefix(&theme, &app_names);
+        });
 
-                match input {
-                    Some(value) => (value, false),
-                    None => {
-                        return;
-                    }
-                }
-            }
-            Ok(None) => {
-                println!("Application selection aborted.");
-                return;
-            }
+        let selected_app_input = match app_prompt.prompt() {
+            Ok(value) => value.trim().to_string(),
+            Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => return,
             Err(err) => {
                 eprintln!("Application selection failed: {err}");
                 return;
             }
         };
 
-        #[derive(Clone)]
-        enum LabelChoice {
-            Existing(String),
-            NoneLabel,
-            CreateNew,
+        let selected_app = selected_app_input.clone();
+
+        let mut all_labels: Vec<String> = apps
+            .values()
+            .flat_map(|stats| stats.labels.iter().cloned())
+            .collect();
+        if let Some(saved) = current_label.as_ref() {
+            all_labels.push(saved.clone());
         }
+        all_labels.sort();
+        all_labels.dedup();
 
-        #[derive(Clone)]
-        struct LabelOption {
-            display: String,
-            choice: LabelChoice,
-        }
-
-        let mut labels: Vec<String> = if selecting_existing {
-            apps.get(&selected_app)
-                .map(|stats| stats.labels.iter().cloned().collect())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        // Ensure the current label (if any) is present so it can be shown consistently.
-        if selecting_existing {
-            if let Some(saved) = current_label.as_ref() {
-                if !labels.iter().any(|label| label == saved) {
-                    labels.insert(0, saved.clone());
-                }
-            }
-        }
-
-        let mut label_options = Vec::with_capacity(labels.len() + 2);
-        for label in labels.iter() {
-            label_options.push(LabelOption {
-                display: format!("  {label}"),
-                choice: LabelChoice::Existing(label.clone()),
-            });
-        }
-
-        let no_label_prefix = "";
-        label_options.push(LabelOption {
-            display: format!(
-                "{}{}",
-                no_label_prefix,
-                format!("- No Label").truecolor(120, 0, 0)
-            ),
-            choice: LabelChoice::NoneLabel,
-        });
-        label_options.push(LabelOption {
-            display: format!("{}", "+ Create new".truecolor(0, 120, 0)),
-            choice: LabelChoice::CreateNew,
-        });
-
-        let label_default = label_options
-            .iter()
-            .enumerate()
-            .find_map(|(idx, opt)| match (&opt.choice, &current_label) {
-                (LabelChoice::Existing(lbl), Some(cur)) if lbl == cur => Some(idx),
-                (LabelChoice::NoneLabel, None) => Some(idx),
-                _ => None,
-            })
-            .unwrap_or_else(|| label_options.len().saturating_sub(2));
-
-        let label_items: Vec<String> = label_options.iter().map(|opt| opt.display.clone()).collect();
-
-        let label_prompt = Select::with_theme(&theme)
-            .with_prompt("Select the label for this application")
-            .items(&label_items)
-            .default(label_default.min(label_items.len().saturating_sub(1)))
-            .interact_opt();
-
-        let selected_label = match label_prompt {
-            Ok(Some(index)) => match label_options.get(index) {
-                Some(opt) => match &opt.choice {
-                    LabelChoice::Existing(label) => Some(label.clone()),
-                    LabelChoice::NoneLabel => None,
-                    LabelChoice::CreateNew => {
-                        let input = Input::with_theme(&theme)
-                            .with_prompt("Enter the new label")
-                            .validate_with(|value: &String| {
-                                if value.trim().is_empty() {
-                                    Err("Label cannot be empty")
-                                } else {
-                                    Ok(())
-                                }
-                            })
-                            .interact_text();
-
-                        match input {
-                            Ok(value) => Some(value.trim().to_string()),
-                            Err(err) => {
-                                eprintln!("Label creation failed: {err}");
-                                return;
-                            }
-                        }
-                    }
-                },
-                None => None,
-            },
-            Ok(None) => {
-                println!("Label selection aborted.");
-                return;
-            }
-            Err(err) => {
-                eprintln!("Label selection failed: {err}");
-                return;
-            }
+        let selected_label = match prompt_label_entry("Label", &all_labels) {
+            Some(value) => value,
+            None => return,
         };
 
         let selected_keyvault = match select_keyvault(
-            &theme,
+            "Key Vault",
             &subscriptions,
             &cached_keyvaults,
             current_keyvault.clone(),
@@ -449,7 +322,7 @@ pub mod app {
     }
 
     fn select_keyvault(
-        theme: &ColorfulTheme,
+        prompt_label: &str,
         subscriptions: &[subscription::Subscription],
         keyvaults: &[CachedKeyVault],
         current: (Option<String>, Option<String>),
@@ -474,14 +347,15 @@ pub mod app {
 
         vaults.sort_by(|a, b| a.name.cmp(&b.name));
 
-        let items: Vec<String> = vaults
+        let menu_items: Vec<MenuItem<KeyVaultSelection>> = vaults
             .iter()
             .map(|kv| {
                 let sub_label = sub_map
                     .get(&kv.subscription_id)
                     .cloned()
                     .unwrap_or_else(|| kv.subscription_id.clone());
-                format!("{} ({})", kv.name, sub_label.dimmed())
+                let label = format!("{} ({})", kv.name, sub_label.dimmed());
+                MenuItem::new(kv.clone(), label)
             })
             .collect();
 
@@ -494,18 +368,14 @@ pub mod app {
         }
         .unwrap_or(0);
 
-        let selection = Select::with_theme(theme)
-            .with_prompt("Select the Key Vault for this application")
-            .items(&items)
-            .default(default_index.min(items.len().saturating_sub(1)))
-            .interact_opt();
+        let len = menu_items.len();
+        let selection = Select::new(prompt_label, menu_items)
+        .with_starting_cursor(default_index.min(len.saturating_sub(1)))
+        .prompt();
 
         match selection {
-            Ok(Some(idx)) => Ok(vaults.get(idx).cloned()),
-            Ok(None) => {
-                println!("Key Vault selection aborted.");
-                Ok(None)
-            }
+            Ok(choice) => Ok(Some(choice.value)),
+            Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => Ok(None),
             Err(err) => Err(crate::azcli::error::AzCliError::CommandFailure {
                 code: None,
                 stderr: format!("{err}"),
@@ -513,95 +383,37 @@ pub mod app {
         }
     }
 
-    fn prompt_new_application_prefix(
-        theme: &ColorfulTheme,
-        existing_apps: &[String],
-    ) -> Option<String> {
-        if existing_apps.is_empty() {
-            return prompt_new_application_prefix_without_hints(theme);
-        }
-
-        match build_hinting_editor(existing_apps) {
-            Ok(mut editor) => {
-                let prompt_label = "Enter the new application prefix";
-                let prompt = format!(
-                    "{} {} ",
-                    "?".yellow(),
-                    prompt_label.bold(),
-                );
-
-                loop {
-                    match editor.readline(&prompt) {
-                        Ok(value) => {
-                            let trimmed: &str = value.trim();
-                            if trimmed.is_empty() {
-                                eprintln!("Application name cannot be empty");
-                                continue;
-                            }
-
-                            let term = Term::stdout();
-                            let _ = term.clear_last_lines(1);
-                            println!(
-                                "{} {} {} {}",
-                                "✔",
-                                prompt_label.bold(),
-                                "·".dimmed(),
-                                trimmed.green()
-                            );
-
-                            return Some(trimmed.to_string());
-                        }
-                        Err(ReadlineError::Interrupted | ReadlineError::Eof) => return None,
-                        Err(err) => {
-                            eprintln!("Application prompt failed: {err}");
-                            return None;
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                eprintln!(
-                    "Interactive suggestion prompt unavailable ({err}). Falling back to basic input."
-                );
-                prompt_new_application_prefix_without_hints(theme)
-            }
-        }
-    }
-
-    fn prompt_new_application_prefix_without_hints(theme: &ColorfulTheme) -> Option<String> {
-        let input = Input::with_theme(theme)
-            .with_prompt("Enter the new application prefix")
-            .validate_with(|value: &String| {
-                if value.trim().is_empty() {
-                    Err("Application name cannot be empty")
-                } else {
-                    Ok(())
-                }
-            })
-            .interact_text();
+    fn prompt_label_entry(prompt_label: &str, existing_labels: &[String]) -> Option<Option<String>> {
+        let input = Text::new(prompt_label)
+            .with_autocomplete(ValueAutocomplete::new(existing_labels))
+            .prompt();
 
         match input {
-            Ok(value) => Some(value.trim().to_string()),
+            Ok(value) => {
+                let trimmed = value.trim().to_string();
+                if trimmed.is_empty() {
+                    Some(None)
+                } else {
+                    Some(Some(trimmed))
+                }
+            }
+            Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
+                println!("Label input aborted.");
+                None
+            }
             Err(err) => {
-                eprintln!("Application creation failed: {err}");
+                eprintln!("Label input failed: {err}");
                 None
             }
         }
     }
 
-    fn build_hinting_editor(
-        existing_apps: &[String],
-    ) -> rustyline::Result<Editor<AppNameHintHelper, DefaultHistory>> {
-        let mut editor = Editor::<AppNameHintHelper, DefaultHistory>::new()?;
-        editor.set_helper(Some(AppNameHintHelper::new(existing_apps)));
-        Ok(editor)
-    }
-
-    struct AppNameHintHelper {
+    #[derive(Clone)]
+    struct ValueAutocomplete {
         suggestions: Vec<String>,
     }
 
-    impl AppNameHintHelper {
+    impl ValueAutocomplete {
         fn new(existing_apps: &[String]) -> Self {
             Self {
                 suggestions: existing_apps.to_vec(),
@@ -609,38 +421,52 @@ pub mod app {
         }
     }
 
-    impl Completer for AppNameHintHelper {
-        type Candidate = String;
-    }
-
-    impl Helper for AppNameHintHelper {}
-
-    impl Highlighter for AppNameHintHelper {
-        fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
-            Cow::Owned(format!("{}", hint.dimmed()))
-        }
-    }
-
-    impl Validator for AppNameHintHelper {}
-
-    impl Hinter for AppNameHintHelper {
-        type Hint = String;
-
-        fn hint(&self, line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<Self::Hint> {
-            if line.trim().is_empty() {
-                return self.suggestions.first().cloned();
+    impl Autocomplete for ValueAutocomplete {
+        fn get_suggestions(&mut self, input: &str) -> Result<Vec<String>, CustomUserError> {
+            let trimmed = input.trim();
+            if trimmed.is_empty() {
+                return Ok(self.suggestions.clone());
             }
 
-            self.suggestions
+            let needle = trimmed.to_ascii_lowercase();
+
+            Ok(self
+                .suggestions
                 .iter()
-                .find(|candidate| candidate.starts_with(line))
-                .and_then(|candidate| {
-                    if candidate == &line {
-                        None
-                    } else {
-                        Some(candidate.strip_prefix(line).unwrap_or_default().to_string())
-                    }
-                })
+                .filter(|candidate| candidate.to_ascii_lowercase().contains(&needle))
+                .cloned()
+                .collect())
+        }
+
+        fn get_completion(
+            &mut self,
+            input: &str,
+            highlighted_suggestion: Option<String>,
+        ) -> Result<Replacement, CustomUserError> {
+            if highlighted_suggestion.is_some() {
+                return Ok(highlighted_suggestion);
+            }
+
+            let trimmed = input.trim();
+            if trimmed.is_empty() {
+                return Ok(self.suggestions.first().cloned());
+            }
+
+            let needle = trimmed.to_ascii_lowercase();
+
+            if let Some(value) = self
+                .suggestions
+                .iter()
+                .find(|candidate| candidate.to_ascii_lowercase().starts_with(&needle))
+            {
+                return Ok(Some(value.clone()));
+            }
+
+            Ok(self
+                .suggestions
+                .iter()
+                .find(|candidate| candidate.to_ascii_lowercase().contains(&needle))
+                .cloned())
         }
     }
 
@@ -813,7 +639,7 @@ pub mod kv {
     };
 
     use clap::ValueEnum;
-    use dialoguer::{theme::ColorfulTheme, Select};
+    use inquire::{InquireError, Select};
     use heck::ToUpperCamelCase;
     use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
     use owo_colors::OwoColorize;
@@ -823,6 +649,7 @@ pub mod kv {
         error::{AzCliError, AzCliResult},
         run::az,
     };
+    use super::MenuItem;
 
     #[derive(Clone, Copy, Debug, ValueEnum)]
     pub enum ExportFormat {
@@ -2141,25 +1968,33 @@ pub mod kv {
     }
 
     fn prompt_value_type(key: &str) -> Option<EntryValueType> {
-        let labels = [
-            "Store as plain value",
-            "Store in Key Vault",
-            "Skip this entry",
+        #[derive(Clone)]
+        enum ValueChoice {
+            Plain,
+            KeyVault,
+            Skip,
+        }
+
+        let options = vec![
+            MenuItem::new(ValueChoice::Plain, "Store as plain value".to_string()),
+            MenuItem::new(ValueChoice::KeyVault, "Store in Key Vault".to_string()),
+            MenuItem::new(ValueChoice::Skip, "Skip this entry".to_string()),
         ];
 
         let prompt = format!("Where should key '{}' be stored?", key);
-        let selection = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt(prompt)
-            .default(0)
-            .items(&labels)
-            .interact_opt();
+        let selection = Select::new(&prompt, options)
+            .with_starting_cursor(0)
+            .prompt();
 
         match selection {
-            Ok(Some(0)) => Some(EntryValueType::Plain),
-            Ok(Some(1)) => Some(EntryValueType::KeyVault),
-            Ok(Some(2)) => None,
-            Ok(Some(_)) => Some(EntryValueType::Plain),
-            Ok(None) => Some(EntryValueType::Plain),
+            Ok(choice) => match choice.value {
+                ValueChoice::Plain => Some(EntryValueType::Plain),
+                ValueChoice::KeyVault => Some(EntryValueType::KeyVault),
+                ValueChoice::Skip => None,
+            },
+            Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
+                Some(EntryValueType::Plain)
+            }
             Err(err) => {
                 eprintln!("Prompt failed for '{}': {}", key, err);
                 None
