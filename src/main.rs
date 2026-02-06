@@ -24,6 +24,8 @@ struct Cli {
 enum Command {
     /// Configure the active App Configuration context and application
     Setup,
+    /// Refresh cached Azure metadata used during setup
+    Sync,
     /// List keys for the current App Configuration/App context
     #[command(alias = "ls")]
     List,
@@ -53,8 +55,6 @@ enum Command {
     Promote { key: String },
     /// Demote a Key Vault reference to a plain value
     Demote { key: String },
-    /// Refresh cached Azure metadata used during setup
-    Sync,
 }
 
 fn main() {
@@ -62,6 +62,7 @@ fn main() {
 
     match cli.command {
         Command::Setup => commands::setup(),
+        Command::Sync => commands::sync(),
         Command::List => kv::list_keys(),
         Command::Show { key } => kv::show_key(&key),
         Command::Set {
@@ -74,6 +75,5 @@ fn main() {
         Command::Delete { keys } => kv::delete_keys(&keys),
         Command::Export { format, file } => kv::export_entries(format, &file),
         Command::Import { file } => kv::import_entries(&file),
-        Command::Sync => commands::sync(),
     }
 }
