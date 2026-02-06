@@ -763,15 +763,9 @@ pub mod kv {
             }
         };
 
-        spinner.finish_with_message("Entries fetched.");
+        spinner.finish_and_clear();
 
         if entries.is_empty() {
-            let app = ctx.app_name.as_deref().unwrap_or("(none)");
-            let label = ctx.label.as_deref().unwrap_or("(none)");
-            println!(
-                "No keys found (label: {}, app: {}).",
-                label, app
-            );
             return;
         }
 
