@@ -644,6 +644,14 @@ pub mod kv {
     use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
     use owo_colors::OwoColorize;
     use serde::Deserialize;
+    use tabled::{
+        settings::{
+            object::Rows,
+            style::{BorderColor, Style},
+            Color,
+        },
+        Table, Tabled,
+    };
 
     use crate::azcli::{
         error::{AzCliError, AzCliResult},
@@ -687,6 +695,16 @@ pub mod kv {
         Plain,
         KeyVault,
         Prompt,
+    }
+
+    #[derive(Tabled)]
+    struct KeyListingRow {
+        #[tabled(rename = "Key")]
+        key: String,
+        #[tabled(rename = "Type")]
+        value_type: String,
+        #[tabled(rename = "Value")]
+        value: String,
     }
 
     #[derive(Debug)]
@@ -769,23 +787,48 @@ pub mod kv {
             return;
         }
 
-        for entry in entries {
-            let key = strip_prefix(&ctx, &entry.key);
-            let (value, from_keyvault) = resolve_value(&entry, false, false);
+        let rows: Vec<KeyListingRow> = entries
+            .into_iter()
+            .map(|entry| {
+                let key = strip_prefix(&ctx, &entry.key);
+                let (value, from_keyvault) = resolve_value(&entry, false, false);
 
-            let detail = if from_keyvault {
-                keyvault_uri_from_entry(&entry)
-                    .map(|uri| truncate_value(&uri, 80))
-                    .unwrap_or_else(|| "[key vault reference]".to_string())
-            } else if value.is_empty() {
-                "(empty)".to_string()
-            } else {
-                truncate_value(&value, 80)
-            };
+                let display_value = if from_keyvault {
+                    keyvault_uri_from_entry(&entry)
+                        .and_then(|uri| {
+                            parse_secret_uri(&uri)
+                                .map(|(vault, secret)| format!("{vault}/{secret}"))
+                                .or(Some(truncate_value(&uri, 40)))
+                        })
+                        .unwrap_or_else(|| truncate_value(&value, 40))
+                } else if value.is_empty() {
+                    "(empty)".to_string()
+                } else {
+                    truncate_value(&value, 40)
+                };
 
-            let line = format_key_line(&key, &detail, from_keyvault, detail == "(empty)");
-            println!("{line}");
+                KeyListingRow {
+                    key,
+                    value_type: if from_keyvault {
+                        "keyvault".to_string()
+                    } else {
+                        "plain".to_string()
+                    },
+                    value: display_value,
+                }
+            })
+            .collect();
+
+        if rows.is_empty() {
+            return;
         }
+
+        let mut table = Table::new(rows);
+        table
+            .with(Style::psql())
+            .with(BorderColor::filled(Color::FG_BRIGHT_BLACK))
+            .modify(Rows::first(), Color::BOLD | Color::FG_BRIGHT_WHITE);
+        println!("{table}");
     }
 
     pub fn show_key(key: &str) {
