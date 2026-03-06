@@ -638,7 +638,6 @@ pub mod kv {
         time::Duration,
     };
 
-    use clap::ValueEnum;
     use inquire::{InquireError, Select};
     use heck::ToUpperCamelCase;
     use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -658,14 +657,6 @@ pub mod kv {
         run::az,
     };
     use super::MenuItem;
-
-    #[derive(Clone, Copy, Debug, ValueEnum)]
-    pub enum ExportFormat {
-        Json,
-        Yaml,
-        Toml,
-        Env,
-    }
 
     #[derive(Debug, Deserialize)]
     struct KeyValue {
@@ -712,14 +703,6 @@ pub mod kv {
         key: String,
         value: String,
         from_keyvault: bool,
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum ImportFormat {
-        Json,
-        Yaml,
-        Toml,
-        Env,
     }
 
     fn create_spinner(initial_message: &str) -> ProgressBar {
@@ -1026,8 +1009,7 @@ pub mod kv {
         }
     }
 
-    pub fn export_entries(format: Option<ExportFormat>, file: &Path) {
-        let format = format.unwrap_or(ExportFormat::Toml);
+    pub fn export_entries(file: &Path) {
         let Some(ctx) = resolve_active_context(true, false) else {
             return;
         };
@@ -1076,15 +1058,8 @@ pub mod kv {
             total, plain_count, keyvault_count
         ));
 
-        let serialized = match format {
-            ExportFormat::Json => serde_json::to_string_pretty(&build_export_payload(&prepared_entries))
-                .map_err(|err| format!("Failed to serialize JSON: {err}")),
-            ExportFormat::Yaml => serde_yaml::to_string(&build_export_payload(&prepared_entries))
-                .map_err(|err| format!("Failed to serialize YAML: {err}")),
-            ExportFormat::Toml => toml::to_string_pretty(&build_export_payload(&prepared_entries))
-                .map_err(|err| format!("Failed to serialize TOML: {err}")),
-            ExportFormat::Env => Ok(serialize_env_entries(&prepared_entries)),
-        };
+        let serialized = serde_yaml::to_string(&build_export_payload(&prepared_entries))
+            .map_err(|err| format!("Failed to serialize YAML: {err}"));
 
         let data = match serialized {
             Ok(data) => data,
@@ -1107,8 +1082,8 @@ pub mod kv {
             );
         } else {
             println!(
-                "Exported {} entries (plain {}, keyvault {}) as {:?} → '{}'.",
-                total, plain_count, keyvault_count, format, file.display()
+                "Exported {} entries (plain {}, keyvault {}) as YAML → '{}'.",
+                total, plain_count, keyvault_count, file.display()
             );
         }
     }
@@ -1134,43 +1109,6 @@ pub mod kv {
         }
 
         serde_json::Value::Object(map)
-    }
-
-    fn serialize_env_entries(entries: &[PreparedExportEntry]) -> String {
-        let mut lines = Vec::with_capacity(entries.len());
-
-        for entry in entries {
-            lines.push(format!(
-                "{}={}",
-                entry.key,
-                encode_env_value(&entry.value)
-            ));
-        }
-
-        let mut data = lines.join("\n");
-        if !data.is_empty() {
-            data.push('\n');
-        }
-        data
-    }
-
-    fn encode_env_value(value: &str) -> String {
-        if !needs_env_quotes(value) {
-            return value.to_string();
-        }
-
-        format!("\"{}\"", escape_double_quoted(value))
-    }
-
-    fn needs_env_quotes(value: &str) -> bool {
-        if value.is_empty() {
-            return true;
-        }
-
-        !value.chars().all(|ch| matches!(
-            ch,
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '.' | '-' | '/' | ':'
-        ))
     }
 
     pub fn import_entries(path: &Path) {
@@ -1654,155 +1592,23 @@ pub mod kv {
             return None;
         }
 
-        let ext = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-
-        let mut errors = Vec::new();
-        for format in format_detection_order(&ext, file_name) {
-            match parse_with_format(format, &contents) {
-                Ok(entries) if entries.is_empty() => {
-                    eprintln!("No entries found in {}.", path.display());
-                    return None;
-                }
-                Ok(entries) => return Some(entries),
-                Err(err) => errors.push((format, err)),
+        match parse_yaml_entries(&contents) {
+            Ok(entries) if entries.is_empty() => {
+                eprintln!("No entries found in {}.", path.display());
+                None
+            }
+            Ok(entries) => Some(entries),
+            Err(err) => {
+                eprintln!("Failed to parse {} as YAML: {}", path.display(), err);
+                None
             }
         }
-
-        if let Some((format, err)) = errors.last() {
-            eprintln!(
-                "Failed to parse {} as {}: {}",
-                path.display(),
-                format.label(),
-                err
-            );
-        } else {
-            eprintln!(
-                "Failed to parse {} as JSON, YAML, TOML, or env.",
-                path.display()
-            );
-        }
-        None
-    }
-
-    fn format_detection_order(ext: &str, file_name: &str) -> Vec<ImportFormat> {
-        let mut order = Vec::new();
-        let mut push_unique = |fmt| {
-            if !order.contains(&fmt) {
-                order.push(fmt);
-            }
-        };
-
-        match ext {
-            "json" => push_unique(ImportFormat::Json),
-            "yaml" | "yml" => push_unique(ImportFormat::Yaml),
-            "toml" => push_unique(ImportFormat::Toml),
-            "env" => push_unique(ImportFormat::Env),
-            _ => {}
-        }
-
-        if is_env_like(file_name) {
-            push_unique(ImportFormat::Env);
-        }
-
-        push_unique(ImportFormat::Json);
-        push_unique(ImportFormat::Yaml);
-        push_unique(ImportFormat::Toml);
-        push_unique(ImportFormat::Env);
-
-        order
-    }
-
-    fn is_env_like(name: &str) -> bool {
-        if name.is_empty() {
-            return false;
-        }
-
-        let lowered = name.to_ascii_lowercase();
-        lowered == "env"
-            || lowered == ".env"
-            || lowered.ends_with(".env")
-            || lowered.contains(".env.")
-    }
-
-    fn parse_with_format(format: ImportFormat, contents: &str) -> Result<Vec<ImportEntry>, String> {
-        match format {
-            ImportFormat::Json => parse_json_entries(contents),
-            ImportFormat::Yaml => parse_yaml_entries(contents),
-            ImportFormat::Toml => parse_toml_entries(contents),
-            ImportFormat::Env => parse_env_entries(contents),
-        }
-    }
-
-    fn parse_json_entries(contents: &str) -> Result<Vec<ImportEntry>, String> {
-        let value: serde_json::Value =
-            serde_json::from_str(contents).map_err(|err| err.to_string())?;
-        entries_from_json_value(value)
     }
 
     fn parse_yaml_entries(contents: &str) -> Result<Vec<ImportEntry>, String> {
         let value: serde_json::Value =
             serde_yaml::from_str(contents).map_err(|err| err.to_string())?;
         entries_from_json_value(value)
-    }
-
-    fn parse_toml_entries(contents: &str) -> Result<Vec<ImportEntry>, String> {
-        let value: toml::Value = toml::from_str(contents).map_err(|err| err.to_string())?;
-        let json_value =
-            serde_json::to_value(value).map_err(|err| format!("TOML conversion failed: {err}"))?;
-        entries_from_json_value(json_value)
-    }
-
-    fn parse_env_entries(contents: &str) -> Result<Vec<ImportEntry>, String> {
-        let mut entries = Vec::new();
-        for (idx, raw_line) in contents.lines().enumerate() {
-            let trimmed = raw_line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-
-            let line = trimmed
-                .strip_prefix("export ")
-                .unwrap_or(trimmed)
-                .trim();
-
-            let Some(eq_idx) = line.find('=') else {
-                eprintln!(
-                    "Skipping line {} ({}): missing '='.",
-                    idx + 1,
-                    raw_line.trim()
-                );
-                continue;
-            };
-
-            let key = line[..eq_idx].trim();
-            if key.is_empty() {
-                eprintln!("Skipping line {}: missing key before '='.", idx + 1);
-                continue;
-            }
-
-            let raw_value = line[eq_idx + 1..].trim();
-            let value = parse_env_value(raw_value);
-
-            entries.push(ImportEntry {
-                key: key.to_string(),
-                value,
-                value_type: EntryValueType::Prompt,
-            });
-        }
-
-        if entries.is_empty() {
-            Err("no key=value pairs found".to_string())
-        } else {
-            Ok(entries)
-        }
     }
 
     fn entries_from_json_value(value: serde_json::Value) -> Result<Vec<ImportEntry>, String> {
@@ -1918,92 +1724,6 @@ pub mod kv {
         }
     }
 
-    fn parse_env_value(raw_value: &str) -> String {
-        let without_comment = strip_env_comment(raw_value);
-        let trimmed = without_comment.trim();
-
-        if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
-            return unescape_double_quoted(&trimmed[1..trimmed.len() - 1]);
-        }
-
-        if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
-            return trimmed[1..trimmed.len() - 1].to_string();
-        }
-
-        trimmed.to_string()
-    }
-
-    fn strip_env_comment(value: &str) -> &str {
-        let mut in_single = false;
-        let mut in_double = false;
-        let mut escaped = false;
-
-        for (idx, ch) in value.char_indices() {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-
-            match ch {
-                '\\' if in_double => {
-                    escaped = true;
-                }
-                '\'' if !in_double => in_single = !in_single,
-                '"' if !in_single => in_double = !in_double,
-                '#' if !in_single && !in_double => return value[..idx].trim_end(),
-                _ => {}
-            }
-        }
-
-        value
-    }
-
-    fn unescape_double_quoted(input: &str) -> String {
-        let mut result = String::with_capacity(input.len());
-        let mut chars = input.chars();
-
-        while let Some(ch) = chars.next() {
-            if ch == '\\' {
-                if let Some(next) = chars.next() {
-                    match next {
-                        'n' => result.push('\n'),
-                        'r' => result.push('\r'),
-                        't' => result.push('\t'),
-                        '\\' => result.push('\\'),
-                        '"' => result.push('"'),
-                        _ => {
-                            result.push('\\');
-                            result.push(next);
-                        }
-                    }
-                } else {
-                    result.push('\\');
-                }
-            } else {
-                result.push(ch);
-            }
-        }
-
-        result
-    }
-
-    fn escape_double_quoted(input: &str) -> String {
-        let mut result = String::with_capacity(input.len());
-
-        for ch in input.chars() {
-            match ch {
-                '\n' => result.push_str("\\n"),
-                '\r' => result.push_str("\\r"),
-                '\t' => result.push_str("\\t"),
-                '\\' => result.push_str("\\\\"),
-                '"' => result.push_str("\\\""),
-                _ => result.push(ch),
-            }
-        }
-
-        result
-    }
-
     fn prompt_value_type(key: &str) -> Option<EntryValueType> {
         #[derive(Clone)]
         enum ValueChoice {
@@ -2045,17 +1765,6 @@ pub mod kv {
                 EntryValueType::Plain => "[plain]",
                 EntryValueType::KeyVault => "[keyvault]",
                 EntryValueType::Prompt => "[prompt]",
-            }
-        }
-    }
-
-    impl ImportFormat {
-        fn label(self) -> &'static str {
-            match self {
-                ImportFormat::Json => "JSON",
-                ImportFormat::Yaml => "YAML",
-                ImportFormat::Toml => "TOML",
-                ImportFormat::Env => ".env",
             }
         }
     }

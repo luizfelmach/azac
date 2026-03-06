@@ -43,12 +43,8 @@ enum Command {
         #[arg(required = true)]
         keys: Vec<String>,
     },
-    /// Export configuration data
-    Export {
-        #[arg(short = 'o', long = "output", value_enum)]
-        format: Option<kv::ExportFormat>,
-        file: PathBuf,
-    },
+    /// Export configuration data as YAML
+    Export { file: PathBuf },
     /// Import configuration data from a file
     Import { file: PathBuf },
     /// Promote a plain value to a Key Vault reference
@@ -73,7 +69,7 @@ fn main() {
         Command::Promote { key } => kv::promote_key(&key),
         Command::Demote { key } => kv::demote_key(&key),
         Command::Delete { keys } => kv::delete_keys(&keys),
-        Command::Export { format, file } => kv::export_entries(format, &file),
+        Command::Export { file } => kv::export_entries(&file),
         Command::Import { file } => kv::import_entries(&file),
     }
 }
