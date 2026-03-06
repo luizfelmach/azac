@@ -2,8 +2,8 @@ use crate::{
     azcli::{appconfig, error::AzCliResult, run::az, subscription},
     cache::{CacheStore, CachedAppConfig, CachedKeyVault, SetupCache},
     context::{
-        default_appconfig_endpoint, default_separator, ActiveContext, AppSelection, Context,
-        ContextStore, SubscriptionMetadata, DEFAULT_APP_CONFIG_ENDPOINT,
+        ActiveContext, AppSelection, Context, ContextStore, DEFAULT_APP_CONFIG_ENDPOINT,
+        SubscriptionMetadata, default_appconfig_endpoint, default_separator,
     },
 };
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -154,22 +154,25 @@ impl<T> fmt::Display for MenuItem<T> {
 }
 
 pub mod app {
-    use std::{collections::{BTreeMap, BTreeSet}, time::Duration};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        time::Duration,
+    };
 
+    use indicatif::ProgressBar;
     use inquire::{
-        autocompletion::Replacement, Autocomplete, CustomUserError, InquireError, Select, Text,
+        Autocomplete, CustomUserError, InquireError, Select, Text, autocompletion::Replacement,
         validator::Validation,
     };
-    use indicatif::ProgressBar;
     use owo_colors::OwoColorize;
     use serde::Deserialize;
     use serde_json;
 
+    use super::MenuItem;
     use crate::{
         azcli::{error::AzCliResult, run::az, subscription},
         cache::CachedKeyVault,
     };
-    use super::MenuItem;
 
     pub fn select_app() {
         let (store, mut context) = match super::load_context() {
@@ -213,10 +216,7 @@ pub mod app {
         let spinner = ProgressBar::new_spinner();
         spinner.set_style(super::standard_spinner_style());
         spinner.enable_steady_tick(Duration::from_millis(80));
-        spinner.set_message(format!(
-            "Inspecting keys in '{}'...",
-            config_name
-        ));
+        spinner.set_message(format!("Inspecting keys in '{}'...", config_name));
 
         let entries = match fetch_all_keys(&endpoint) {
             Ok(entries) => entries,
@@ -246,8 +246,14 @@ pub mod app {
         }
 
         if let Some(current) = current_app.as_ref() {
-            let stats = apps.entry(current.clone()).or_insert_with(AppStats::default);
-            if let Some(label) = current_label.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            let stats = apps
+                .entry(current.clone())
+                .or_insert_with(AppStats::default);
+            if let Some(label) = current_label
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
                 stats.labels.insert(label.to_string());
             }
         }
@@ -255,14 +261,16 @@ pub mod app {
         let app_names: Vec<String> = apps.keys().cloned().collect();
 
         let app_prompt = Text::new("Application")
-        .with_autocomplete(ValueAutocomplete::new(&app_names))
-        .with_validator(|value: &str| {
-            if value.trim().is_empty() {
-                Ok(Validation::Invalid("Application name cannot be empty".into()))
-            } else {
-                Ok(Validation::Valid)
-            }
-        });
+            .with_autocomplete(ValueAutocomplete::new(&app_names))
+            .with_validator(|value: &str| {
+                if value.trim().is_empty() {
+                    Ok(Validation::Invalid(
+                        "Application name cannot be empty".into(),
+                    ))
+                } else {
+                    Ok(Validation::Valid)
+                }
+            });
 
         let selected_app_input = match app_prompt.prompt() {
             Ok(value) => value.trim().to_string(),
@@ -312,8 +320,9 @@ pub mod app {
             active.app.name = Some(selected_app.clone());
             active.app.label = selected_label.clone();
             active.app.keyvault = selected_keyvault.as_ref().map(|kv| kv.name.clone());
-            active.app.keyvault_subscription =
-                selected_keyvault.as_ref().map(|kv| kv.subscription_id.clone());
+            active.app.keyvault_subscription = selected_keyvault
+                .as_ref()
+                .map(|kv| kv.subscription_id.clone());
         }
 
         if !super::save_context(&store, &context) {
@@ -370,8 +379,8 @@ pub mod app {
 
         let len = menu_items.len();
         let selection = Select::new(prompt_label, menu_items)
-        .with_starting_cursor(default_index.min(len.saturating_sub(1)))
-        .prompt();
+            .with_starting_cursor(default_index.min(len.saturating_sub(1)))
+            .prompt();
 
         match selection {
             Ok(choice) => Ok(Some(choice.value)),
@@ -383,7 +392,10 @@ pub mod app {
         }
     }
 
-    fn prompt_label_entry(prompt_label: &str, existing_labels: &[String]) -> Option<Option<String>> {
+    fn prompt_label_entry(
+        prompt_label: &str,
+        existing_labels: &[String],
+    ) -> Option<Option<String>> {
         let input = Text::new(prompt_label)
             .with_autocomplete(ValueAutocomplete::new(existing_labels))
             .prompt();
@@ -508,7 +520,8 @@ pub mod app {
 
     fn keyvault_name(entry: &KeyValue) -> Option<String> {
         if let Some(value) = entry.value.as_deref() {
-            if let Some(uri) = parse_keyvault_reference(value).or_else(|| parse_keyvault_json(value))
+            if let Some(uri) =
+                parse_keyvault_reference(value).or_else(|| parse_keyvault_json(value))
             {
                 return vault_name_from_uri(&uri);
             }
@@ -627,36 +640,36 @@ pub mod app {
 
 pub mod kv {
     use std::{
-        collections::VecDeque,
+        collections::{BTreeMap, VecDeque},
         fs,
         path::Path,
         sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
         },
         thread,
         time::Duration,
     };
 
-    use inquire::{InquireError, Select};
     use heck::ToUpperCamelCase;
     use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+    use inquire::{InquireError, Select};
     use owo_colors::OwoColorize;
     use serde::Deserialize;
     use tabled::{
+        Table, Tabled,
         settings::{
+            Color,
             object::Rows,
             style::{BorderColor, Style},
-            Color,
         },
-        Table, Tabled,
     };
 
+    use super::MenuItem;
     use crate::azcli::{
         error::{AzCliError, AzCliResult},
         run::az,
     };
-    use super::MenuItem;
 
     #[derive(Debug, Deserialize)]
     struct KeyValue {
@@ -698,11 +711,12 @@ pub mod kv {
         value: String,
     }
 
-    #[derive(Debug)]
-    struct PreparedExportEntry {
-        key: String,
+    #[derive(Clone, Debug)]
+    struct EntrySnapshot {
         value: String,
-        from_keyvault: bool,
+        value_type: EntryValueType,
+        secret_uri: Option<String>,
+        value_known: bool,
     }
 
     fn create_spinner(initial_message: &str) -> ProgressBar {
@@ -1014,65 +1028,47 @@ pub mod kv {
             return;
         };
 
-        let spinner = ProgressBar::new_spinner();
-        if let Ok(style) = ProgressStyle::with_template("{spinner:.green} {msg}") {
-            spinner.set_style(style);
-        }
-        spinner.enable_steady_tick(Duration::from_millis(80));
-        spinner.set_message("Fetching configuration entries...");
-
-        let entries = match fetch_entries(&ctx) {
+        let spinner = create_spinner("Fetching configuration entries...");
+        let snapshots = match collect_export_snapshots(&ctx) {
             Ok(entries) => entries,
             Err(err) => {
+                spinner.finish_and_clear();
                 eprintln!("Failed to export entries: {err}");
                 return;
             }
         };
 
+        let total = snapshots.len();
+        let keyvault_count = snapshots
+            .values()
+            .filter(|entry| entry.value_type == EntryValueType::KeyVault)
+            .count();
+        let plain_count = total.saturating_sub(keyvault_count);
+
         spinner.set_message("Preparing export payload...");
 
-        let mut prepared_entries = Vec::new();
-        let mut total = 0usize;
-        let mut keyvault_count = 0usize;
-        let mut plain_count = 0usize;
-
-        for entry in entries {
-            let key = strip_prefix(&ctx, &entry.key);
-            let (value, from_keyvault) = resolve_value(&entry, true, false);
-            prepared_entries.push(PreparedExportEntry {
-                key,
-                value,
-                from_keyvault,
-            });
-
-            total += 1;
-            if from_keyvault {
-                keyvault_count += 1;
-            } else {
-                plain_count += 1;
-            }
-        }
-
-        spinner.finish_with_message(format!(
-            "Prepared {} entries (plain {}, keyvault {}).",
-            total, plain_count, keyvault_count
-        ));
-
-        let serialized = serde_yaml::to_string(&build_export_payload(&prepared_entries))
+        let serialized = serde_yaml::to_string(&build_export_payload(&snapshots))
             .map_err(|err| format!("Failed to serialize YAML: {err}"));
 
         let data = match serialized {
             Ok(data) => data,
             Err(err) => {
+                spinner.finish_and_clear();
                 eprintln!("{err}");
                 return;
             }
         };
 
         if let Err(err) = fs::write(file, data.as_bytes()) {
+            spinner.finish_and_clear();
             eprintln!("Failed to write {}: {}", file.display(), err);
             return;
         }
+
+        spinner.finish_with_message(format!(
+            "Prepared {} entries (plain {}, keyvault {}).",
+            total, plain_count, keyvault_count
+        ));
 
         if total == 0 {
             println!(
@@ -1083,32 +1079,411 @@ pub mod kv {
         } else {
             println!(
                 "Exported {} entries (plain {}, keyvault {}) as YAML → '{}'.",
-                total, plain_count, keyvault_count, file.display()
+                total,
+                plain_count,
+                keyvault_count,
+                file.display()
             );
         }
     }
 
-    fn build_export_payload(entries: &[PreparedExportEntry]) -> serde_json::Value {
-        let mut map = serde_json::Map::new();
+    pub fn plan(file: &Path) {
+        let Some(ctx) = resolve_active_context(true, false) else {
+            return;
+        };
+
+        let spinner = create_spinner("Fetching configuration entries...");
+        let live_entries = match collect_export_snapshots(&ctx) {
+            Ok(entries) => entries,
+            Err(err) => {
+                spinner.finish_and_clear();
+                eprintln!("Failed to build plan: {err}");
+                return;
+            }
+        };
+        spinner.finish_and_clear();
+
+        let Some(file_entries) = parse_import_map(file) else {
+            return;
+        };
+
+        let report = build_plan_report(&ctx, &live_entries, file_entries);
+        print_plan_report(&ctx, &report, file);
+    }
+
+    fn build_plan_report(
+        ctx: &ActiveKvContext,
+        live_entries: &BTreeMap<String, EntrySnapshot>,
+        file_entries: Vec<ImportEntry>,
+    ) -> PlanReport {
+        let mut report = PlanReport::default();
+
+        for entry in file_entries {
+            if entry.value_type == EntryValueType::Prompt {
+                continue;
+            }
+
+            if let Some(snapshot) = live_entries.get(&entry.key) {
+                plan_existing_entry(ctx, &entry, snapshot, &mut report);
+            } else {
+                let full_key = prefix_key(ctx, &entry.key);
+                plan_new_entry(ctx, &entry, &full_key, &mut report);
+            }
+        }
+
+        report
+    }
+
+    fn collect_export_snapshots(
+        ctx: &ActiveKvContext,
+    ) -> AzCliResult<BTreeMap<String, EntrySnapshot>> {
+        let entries = fetch_entries(ctx)?;
+        let mut snapshots = BTreeMap::new();
 
         for entry in entries {
+            let key = strip_prefix(ctx, &entry.key);
+            let (value, from_keyvault) = resolve_value(&entry, true, false);
+            let value_type = if from_keyvault {
+                EntryValueType::KeyVault
+            } else {
+                EntryValueType::Plain
+            };
+            let secret_uri = keyvault_uri_from_entry(&entry);
+            let value_known = if from_keyvault {
+                match secret_uri.as_ref() {
+                    Some(uri) => value != *uri,
+                    None => false,
+                }
+            } else {
+                true
+            };
+            snapshots.insert(
+                key,
+                EntrySnapshot {
+                    value,
+                    value_type,
+                    secret_uri,
+                    value_known,
+                },
+            );
+        }
+
+        Ok(snapshots)
+    }
+
+    fn build_export_payload(entries: &BTreeMap<String, EntrySnapshot>) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+
+        for (key, entry) in entries {
             let mut obj = serde_json::Map::new();
             obj.insert(
                 "type".to_string(),
-                serde_json::Value::String(if entry.from_keyvault {
-                    "keyvault".to_string()
-                } else {
-                    "plain".to_string()
+                serde_json::Value::String(match entry.value_type {
+                    EntryValueType::KeyVault => "keyvault".to_string(),
+                    _ => "plain".to_string(),
                 }),
             );
             obj.insert(
                 "value".to_string(),
                 serde_json::Value::String(entry.value.clone()),
             );
-            map.insert(entry.key.clone(), serde_json::Value::Object(obj));
+            map.insert(key.clone(), serde_json::Value::Object(obj));
         }
 
         serde_json::Value::Object(map)
+    }
+
+    #[derive(Default)]
+    struct PlanReport {
+        actions: Vec<PlanAction>,
+    }
+
+    struct PlanAction {
+        key: String,
+        kind: PlanActionKind,
+    }
+
+    #[derive(Tabled)]
+    struct PlanTableRow {
+        #[tabled(rename = "")]
+        status: String,
+        #[tabled(rename = "TYPE")]
+        value_type: String,
+        #[tabled(rename = "NAME")]
+        name: String,
+        #[tabled(rename = "PLAN")]
+        plan: String,
+        #[tabled(rename = "KEYVAULT")]
+        keyvault_ref: String,
+    }
+
+    enum PlanActionKind {
+        CreatePlain,
+        UpdatePlain,
+        CreateKeyVault {
+            secret_uri: String,
+        },
+        UpdateKeyVault {
+            secret_uri: String,
+        },
+        TypeChange {
+            from_type: EntryValueType,
+            to_type: EntryValueType,
+            detail: Option<String>,
+        },
+    }
+
+    fn plan_existing_entry(
+        ctx: &ActiveKvContext,
+        entry: &ImportEntry,
+        snapshot: &EntrySnapshot,
+        report: &mut PlanReport,
+    ) {
+        match snapshot.value_type {
+            EntryValueType::KeyVault => plan_existing_keyvault(entry, snapshot, report),
+            _ => plan_existing_plain(ctx, entry, snapshot, report),
+        }
+    }
+
+    fn plan_existing_plain(
+        ctx: &ActiveKvContext,
+        entry: &ImportEntry,
+        snapshot: &EntrySnapshot,
+        report: &mut PlanReport,
+    ) {
+        if entry.value_type == EntryValueType::KeyVault {
+            let full_key = prefix_key(ctx, &entry.key);
+            let detail =
+                expected_secret_uri(ctx, &full_key).map(|uri| display_secret_reference(&uri));
+            report.actions.push(PlanAction {
+                key: entry.key.clone(),
+                kind: PlanActionKind::TypeChange {
+                    from_type: EntryValueType::Plain,
+                    to_type: EntryValueType::KeyVault,
+                    detail,
+                },
+            });
+            return;
+        }
+
+        if snapshot.value != entry.value {
+            report.actions.push(PlanAction {
+                key: entry.key.clone(),
+                kind: PlanActionKind::UpdatePlain,
+            });
+        }
+    }
+
+    fn plan_existing_keyvault(
+        entry: &ImportEntry,
+        snapshot: &EntrySnapshot,
+        report: &mut PlanReport,
+    ) {
+        let Some(secret_uri) = snapshot.secret_uri.as_ref() else {
+            return;
+        };
+
+        if entry.value_type == EntryValueType::Plain {
+            report.actions.push(PlanAction {
+                key: entry.key.clone(),
+                kind: PlanActionKind::TypeChange {
+                    from_type: EntryValueType::KeyVault,
+                    to_type: EntryValueType::Plain,
+                    detail: Some(display_secret_reference(secret_uri)),
+                },
+            });
+            return;
+        }
+
+        let need_update = if snapshot.value_known {
+            snapshot.value != entry.value
+        } else {
+            true
+        };
+
+        if need_update {
+            report.actions.push(PlanAction {
+                key: entry.key.clone(),
+                kind: PlanActionKind::UpdateKeyVault {
+                    secret_uri: secret_uri.clone(),
+                },
+            });
+        }
+    }
+
+    fn plan_new_entry(
+        ctx: &ActiveKvContext,
+        entry: &ImportEntry,
+        full_key: &str,
+        report: &mut PlanReport,
+    ) {
+        match entry.value_type {
+            EntryValueType::Plain => {
+                report.actions.push(PlanAction {
+                    key: entry.key.clone(),
+                    kind: PlanActionKind::CreatePlain,
+                });
+            }
+            EntryValueType::KeyVault => match expected_secret_uri(ctx, full_key) {
+                Some(secret_uri) => {
+                    report.actions.push(PlanAction {
+                        key: entry.key.clone(),
+                        kind: PlanActionKind::CreateKeyVault { secret_uri },
+                    });
+                }
+                None => {}
+            },
+            EntryValueType::Prompt => {}
+        }
+    }
+
+    fn expected_secret_uri(ctx: &ActiveKvContext, full_key: &str) -> Option<String> {
+        let vault_base = ensure_vault_base(ctx)?;
+        let secret_name = secret_name_from_key(full_key);
+        Some(format!("{}/secrets/{}", vault_base, secret_name))
+    }
+
+    fn display_secret_reference(secret_uri: &str) -> String {
+        parse_secret_uri(secret_uri)
+            .map(|(vault, name)| format!("{}/{}", vault, name))
+            .unwrap_or_else(|| secret_uri.to_string())
+    }
+
+    fn entry_type_name(value_type: EntryValueType) -> &'static str {
+        match value_type {
+            EntryValueType::Plain => "plain",
+            EntryValueType::KeyVault => "keyvault",
+            EntryValueType::Prompt => "prompt",
+        }
+    }
+
+    fn print_plan_report(ctx: &ActiveKvContext, report: &PlanReport, file: &Path) {
+        println!("Planning to update:");
+        println!(
+            "  app {}",
+            ctx.app_name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .unwrap_or("none")
+        );
+        println!(
+            "  label {}",
+            ctx.label
+                .as_deref()
+                .filter(|label| !label.is_empty())
+                .unwrap_or("none")
+        );
+        println!("  config {}", ctx.config_name);
+        println!(
+            "  keyvault {}",
+            ctx.keyvault
+                .as_deref()
+                .filter(|kv| !kv.is_empty())
+                .unwrap_or("none")
+        );
+
+        if report.actions.is_empty() {
+            println!(
+                "Configuration already matches snapshot '{}'.",
+                file.display()
+            );
+            return;
+        }
+
+        let create_total = report
+            .actions
+            .iter()
+            .filter(|action| {
+                matches!(
+                    action.kind,
+                    PlanActionKind::CreatePlain | PlanActionKind::CreateKeyVault { .. }
+                )
+            })
+            .count();
+        let update_total = report
+            .actions
+            .iter()
+            .filter(|action| {
+                matches!(
+                    action.kind,
+                    PlanActionKind::UpdatePlain | PlanActionKind::UpdateKeyVault { .. }
+                )
+            })
+            .count();
+
+        let rows: Vec<PlanTableRow> = report
+            .actions
+            .iter()
+            .map(|action| match &action.kind {
+                PlanActionKind::CreatePlain => PlanTableRow {
+                    status: "+".to_string(),
+                    value_type: "plain".to_string(),
+                    name: action.key.clone(),
+                    plan: "create".to_string(),
+                    keyvault_ref: String::new(),
+                },
+                PlanActionKind::UpdatePlain => PlanTableRow {
+                    status: "~".to_string(),
+                    value_type: "plain".to_string(),
+                    name: action.key.clone(),
+                    plan: "update".to_string(),
+                    keyvault_ref: String::new(),
+                },
+                PlanActionKind::CreateKeyVault { secret_uri } => PlanTableRow {
+                    status: "+".to_string(),
+                    value_type: "keyvault".to_string(),
+                    name: action.key.clone(),
+                    plan: "create".to_string(),
+                    keyvault_ref: display_secret_reference(secret_uri),
+                },
+                PlanActionKind::UpdateKeyVault { secret_uri } => PlanTableRow {
+                    status: "~".to_string(),
+                    value_type: "keyvault".to_string(),
+                    name: action.key.clone(),
+                    plan: "update".to_string(),
+                    keyvault_ref: display_secret_reference(secret_uri),
+                },
+                PlanActionKind::TypeChange {
+                    from_type,
+                    to_type,
+                    detail,
+                } => {
+                    let transition = format!(
+                        "{} -> {}",
+                        entry_type_name(*from_type),
+                        entry_type_name(*to_type)
+                    );
+                    PlanTableRow {
+                        status: "!".to_string(),
+                        value_type: transition,
+                        name: action.key.clone(),
+                        plan: "type change".to_string(),
+                        keyvault_ref: detail.clone().unwrap_or_default(),
+                    }
+                }
+            })
+            .collect();
+
+        let mut table = Table::new(rows);
+        table.with(Style::blank());
+
+        let table_str = table.to_string();
+        println!();
+        for line in table_str.lines() {
+            println!("{}", line);
+        }
+
+        let type_change_total = report
+            .actions
+            .iter()
+            .filter(|action| matches!(action.kind, PlanActionKind::TypeChange { .. }))
+            .count();
+
+        println!();
+        println!("Summary:");
+        println!("  + {} to create", create_total);
+        println!("  ~ {} to update", update_total);
+        println!("  ! {} type change", type_change_total);
     }
 
     pub fn import_entries(path: &Path) {
@@ -1187,41 +1562,36 @@ pub mod kv {
             let mp = multi.clone();
             let entry_style = Arc::clone(&entry_style);
 
-            handles.push(thread::spawn(move || loop {
-                let entry = {
-                    let mut guard = queue.lock().expect("import queue poisoned");
-                    guard.pop_front()
-                };
+            handles.push(thread::spawn(move || {
+                loop {
+                    let entry = {
+                        let mut guard = queue.lock().expect("import queue poisoned");
+                        guard.pop_front()
+                    };
 
-                let Some(entry) = entry else {
-                    break;
-                };
+                    let Some(entry) = entry else {
+                        break;
+                    };
 
-                let spinner = mp.add(ProgressBar::new_spinner());
-                spinner.set_style(entry_style.as_ref().clone());
-                spinner.set_message(format!(
-                    "{} {}",
-                    entry.key,
-                    entry.value_type.label()
-                ));
-                spinner.enable_steady_tick(Duration::from_millis(80));
+                    let spinner = mp.add(ProgressBar::new_spinner());
+                    spinner.set_style(entry_style.as_ref().clone());
+                    spinner.set_message(format!("{} {}", entry.key, entry.value_type.label()));
+                    spinner.enable_steady_tick(Duration::from_millis(80));
 
-                if process_import_entry(ctx.as_ref(), &entry) {
-                    success_counter.fetch_add(1, Ordering::Relaxed);
-                    spinner.finish_with_message(format!(
-                        "✔ {} {}",
-                        entry.key,
-                        entry.value_type.label()
-                    ));
-                } else {
-                    failure_counter.fetch_add(1, Ordering::Relaxed);
-                    spinner.finish_with_message(format!(
-                        "✖ {} (see logs)",
-                        entry.key
-                    ));
+                    if process_import_entry(ctx.as_ref(), &entry) {
+                        success_counter.fetch_add(1, Ordering::Relaxed);
+                        spinner.finish_with_message(format!(
+                            "✔ {} {}",
+                            entry.key,
+                            entry.value_type.label()
+                        ));
+                    } else {
+                        failure_counter.fetch_add(1, Ordering::Relaxed);
+                        spinner.finish_with_message(format!("✖ {} (see logs)", entry.key));
+                    }
+
+                    summary_bar.inc(1);
                 }
-
-                summary_bar.inc(1);
             }));
         }
 
@@ -1273,21 +1643,13 @@ pub mod kv {
             return None;
         }
 
-        let label = active
-            .app
-            .label
-            .clone()
-            .filter(|lbl| !lbl.is_empty());
+        let label = active.app.label.clone().filter(|lbl| !lbl.is_empty());
         if require_label && label.is_none() {
             eprintln!("No label configured for the current application.");
             return None;
         }
 
-        let keyvault = active
-            .app
-            .keyvault
-            .clone()
-            .filter(|kv| !kv.is_empty());
+        let keyvault = active.app.keyvault.clone().filter(|kv| !kv.is_empty());
 
         Some(ActiveKvContext {
             config_name: active.config_name.clone(),
@@ -1533,10 +1895,11 @@ pub mod kv {
     }
 
     fn set_secret_value(uri: &str, value: &str) -> AzCliResult<()> {
-        let (vault_name, secret_name) = parse_secret_uri(uri).ok_or_else(|| AzCliError::CommandFailure {
-            code: None,
-            stderr: format!("Invalid Key Vault secret URI: {uri}"),
-        })?;
+        let (vault_name, secret_name) =
+            parse_secret_uri(uri).ok_or_else(|| AzCliError::CommandFailure {
+                code: None,
+                stderr: format!("Invalid Key Vault secret URI: {uri}"),
+            })?;
 
         let _: serde_json::Value = az([
             "keyvault",
@@ -1612,9 +1975,9 @@ pub mod kv {
     }
 
     fn entries_from_json_value(value: serde_json::Value) -> Result<Vec<ImportEntry>, String> {
-        let map = value.as_object().ok_or_else(|| {
-            "Import file must contain a mapping of keys to values.".to_string()
-        })?;
+        let map = value
+            .as_object()
+            .ok_or_else(|| "Import file must contain a mapping of keys to values.".to_string())?;
 
         Ok(map_to_entries(map))
     }
@@ -1682,17 +2045,18 @@ pub mod kv {
         }
 
         let write_result = match entry.value_type {
-            EntryValueType::KeyVault => match build_keyvault_reference(ctx, &full_key, &entry.value)
-            {
-                Some(secret_uri) => write_keyvault_entry(ctx, &full_key, &secret_uri),
-                None => {
-                    eprintln!(
-                        "Skipping '{}' (keyvault type) because no Key Vault is configured.",
-                        entry.key
-                    );
-                    return false;
+            EntryValueType::KeyVault => {
+                match build_keyvault_reference(ctx, &full_key, &entry.value) {
+                    Some(secret_uri) => write_keyvault_entry(ctx, &full_key, &secret_uri),
+                    None => {
+                        eprintln!(
+                            "Skipping '{}' (keyvault type) because no Key Vault is configured.",
+                            entry.key
+                        );
+                        return false;
+                    }
                 }
-            },
+            }
             EntryValueType::Plain => write_entry(ctx, &full_key, &entry.value, None),
             EntryValueType::Prompt => {
                 eprintln!(
@@ -1838,7 +2202,11 @@ pub mod kv {
         Some((vault_name, name.to_string()))
     }
 
-    fn create_or_update_secret(vault_base: &str, secret_name: &str, value: &str) -> AzCliResult<()> {
+    fn create_or_update_secret(
+        vault_base: &str,
+        secret_name: &str,
+        value: &str,
+    ) -> AzCliResult<()> {
         let vault_name = vault_base
             .trim_start_matches("https://")
             .trim_start_matches("http://")
@@ -2105,8 +2473,7 @@ fn fetch_keyvault_inventory(
         ])?;
 
         for res in resources {
-            let sub_id =
-                subscription_from_resource_id(&res.id).unwrap_or_else(|| sub.id.clone());
+            let sub_id = subscription_from_resource_id(&res.id).unwrap_or_else(|| sub.id.clone());
             vaults.push(CachedKeyVault {
                 name: res.name,
                 subscription_id: sub_id,
