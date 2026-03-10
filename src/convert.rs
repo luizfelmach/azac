@@ -17,8 +17,10 @@ pub fn run(command: ConvertCommand) {
                 eprintln!("{}", err);
             }
         }
-        ConvertCommand::Dotnet { .. } => {
-            eprintln!("dotnet config conversion is not implemented yet.");
+        ConvertCommand::Dotnet { file } => {
+            if let Err(err) = convert_dotnet(&file) {
+                eprintln!("{}", err);
+            }
         }
     }
 }
@@ -29,16 +31,38 @@ fn convert_env(path: &Path) -> Result<(), ConvertError> {
     let mut vars = BTreeMap::new();
 
     for item in dotenvy::from_read_iter(file) {
-        let (key, value) = item.map_err(ConvertError::Parse)?;
-        if vars.insert(key.clone(), value).is_some() {
-            eprintln!("Warning: duplicate key '{key}' found. Last value wins.");
-        }
+        let (key, value) = item.map_err(ConvertError::EnvParse)?;
+        insert_or_warn(&mut vars, key, value);
     }
 
     let payload = to_yaml_payload(&vars);
     let output = serde_yaml::to_string(&payload).map_err(ConvertError::Serialize)?;
     print!("{}", output);
     Ok(())
+}
+
+fn convert_dotnet(path: &Path) -> Result<(), ConvertError> {
+    let file = File::open(path).map_err(|err| ConvertError::Io(path.to_path_buf(), err))?;
+    let json: Value =
+        serde_json::from_reader(file).map_err(|err| ConvertError::Json(path.to_path_buf(), err))?;
+
+    let vars = flatten_dotnet_json(&json, path)?;
+    let payload = to_yaml_payload(&vars);
+    let output = serde_yaml::to_string(&payload).map_err(ConvertError::Serialize)?;
+    print!("{}", output);
+    Ok(())
+}
+
+fn flatten_dotnet_json(value: &Value, path: &Path) -> Result<BTreeMap<String, String>, ConvertError> {
+    let root = value
+        .as_object()
+        .ok_or_else(|| ConvertError::UnsupportedRoot(path.to_path_buf()))?;
+
+    let mut vars = BTreeMap::new();
+    for (key, child) in root {
+        flatten_value(child, key, &mut vars);
+    }
+    Ok(vars)
 }
 
 fn to_yaml_payload(vars: &BTreeMap<String, String>) -> Value {
@@ -54,6 +78,47 @@ fn to_yaml_payload(vars: &BTreeMap<String, String>) -> Value {
     Value::Object(map)
 }
 
+fn flatten_value(value: &Value, prefix: &str, vars: &mut BTreeMap<String, String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let next = join_key(prefix, key);
+                flatten_value(child, &next, vars);
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                let next = join_key(prefix, &index.to_string());
+                flatten_value(child, &next, vars);
+            }
+        }
+        _ => {
+            let value_str = match value {
+                Value::String(s) => s.clone(),
+                Value::Number(num) => num.to_string(),
+                Value::Bool(b) => b.to_string(),
+                Value::Null => String::new(),
+                _ => value.to_string(),
+            };
+            insert_or_warn(vars, prefix.to_string(), value_str);
+        }
+    }
+}
+
+fn join_key(prefix: &str, segment: &str) -> String {
+    if prefix.is_empty() {
+        segment.to_string()
+    } else {
+        format!("{prefix}__{segment}")
+    }
+}
+
+fn insert_or_warn(map: &mut BTreeMap<String, String>, key: String, value: String) {
+    if map.insert(key.clone(), value).is_some() {
+        eprintln!("Warning: duplicate key '{key}' found. Last value wins.");
+    }
+}
+
 mod cli {
     use super::*;
 
@@ -64,11 +129,10 @@ mod cli {
             #[arg(value_name = "FILE", value_parser = clap::value_parser!(PathBuf))]
             file: PathBuf,
         },
-        /// Placeholder for future .NET configuration conversion
-        #[command(hide = true)]
+        /// Convert a .NET appsettings.json file into the azac YAML format
         Dotnet {
-            #[arg(value_name = "FILE", required = false)]
-            _file: Option<PathBuf>,
+            #[arg(value_name = "FILE", value_parser = clap::value_parser!(PathBuf))]
+            file: PathBuf,
         },
     }
 }
@@ -76,7 +140,9 @@ mod cli {
 #[derive(Debug)]
 enum ConvertError {
     Io(PathBuf, io::Error),
-    Parse(dotenvy::Error),
+    EnvParse(dotenvy::Error),
+    Json(PathBuf, serde_json::Error),
+    UnsupportedRoot(PathBuf),
     Serialize(serde_yaml::Error),
 }
 
@@ -86,7 +152,15 @@ impl fmt::Display for ConvertError {
             ConvertError::Io(path, err) => {
                 write!(f, "Failed to read {}: {}", path.display(), err)
             }
-            ConvertError::Parse(err) => write!(f, "Failed to parse .env file: {err}"),
+            ConvertError::EnvParse(err) => write!(f, "Failed to parse .env file: {err}"),
+            ConvertError::Json(path, err) => {
+                write!(f, "Failed to parse JSON from {}: {}", path.display(), err)
+            }
+            ConvertError::UnsupportedRoot(path) => write!(
+                f,
+                "Expected a JSON object at the root of {}, but found another type.",
+                path.display()
+            ),
             ConvertError::Serialize(err) => write!(f, "Failed to serialize YAML: {err}"),
         }
     }
@@ -97,6 +171,7 @@ impl std::error::Error for ConvertError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn converts_basic_env_entries() {
@@ -110,5 +185,45 @@ mod tests {
         let foo = obj.get("FOO").unwrap().as_object().unwrap();
         assert_eq!(foo.get("type").unwrap(), "plain");
         assert_eq!(foo.get("value").unwrap(), "bar");
+    }
+
+    #[test]
+    fn flattens_nested_dotnet_structure() {
+        let json = serde_json::json!({
+            "BemobySettings": {
+                "Host": "__BemobyHost__",
+                "Login": {
+                    "Username": "__BemobyUsername__",
+                    "Password": "__BemobyPassword__",
+                    "TokenExpirationTimeInMinutes": "__BemobyTokenExpirationTimeInMinutes__"
+                }
+            }
+        });
+
+        let vars = flatten_dotnet_json(&json, Path::new("appsettings.json")).unwrap();
+        assert_eq!(vars.get("BemobySettings__Host").unwrap(), "__BemobyHost__");
+        assert_eq!(
+            vars.get("BemobySettings__Login__Password").unwrap(),
+            "__BemobyPassword__"
+        );
+        assert_eq!(
+            vars.get("BemobySettings__Login__TokenExpirationTimeInMinutes")
+                .unwrap(),
+            "__BemobyTokenExpirationTimeInMinutes__"
+        );
+    }
+
+    #[test]
+    fn flattens_arrays_with_indices() {
+        let json = serde_json::json!({
+            "Servers": [
+                {"Host": "one"},
+                {"Host": "two"}
+            ]
+        });
+
+        let vars = flatten_dotnet_json(&json, Path::new("settings.json")).unwrap();
+        assert_eq!(vars.get("Servers__0__Host").unwrap(), "one");
+        assert_eq!(vars.get("Servers__1__Host").unwrap(), "two");
     }
 }
