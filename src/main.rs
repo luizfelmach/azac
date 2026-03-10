@@ -2,9 +2,11 @@ mod azcli;
 mod cache;
 mod commands;
 mod context;
+mod convert;
 
 use clap::{Parser, Subcommand};
 use commands::kv;
+use convert::ConvertCommand;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -53,6 +55,11 @@ enum Command {
     Promote { key: String },
     /// Demote a Key Vault reference to a plain value
     Demote { key: String },
+    /// Convert configuration files into the azac YAML schema
+    Convert {
+        #[command(subcommand)]
+        target: ConvertCommand,
+    },
 }
 
 fn main() {
@@ -74,5 +81,6 @@ fn main() {
         Command::Plan { file } => kv::plan(&file),
         Command::Export { file } => kv::export_entries(&file),
         Command::Import { file } => kv::import_entries(&file),
+        Command::Convert { target } => convert::run(target),
     }
 }
