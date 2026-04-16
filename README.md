@@ -13,7 +13,7 @@ O `azac` usa o Azure CLI (`az`) para:
 
 ---
 
-## How to install
+## How to install / Como instalar
 
 ### Pré-requisitos
 
@@ -41,7 +41,7 @@ Baixe o binário em **GitHub Releases** e adicione ao seu `PATH`.
 
 ---
 
-## How to use
+## How to use / Como usar
 
 ### 1) Configuração inicial
 
