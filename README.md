@@ -1,33 +1,33 @@
 # azac
 
-Opinionated CLI para gerenciar **Azure App Configuration** com suporte a **Key Vault**.
+Opinionated CLI for managing **Azure App Configuration** with **Key Vault** support.
 
-## O que a ferramenta faz
+## What this tool does
 
-O `azac` usa o Azure CLI (`az`) para:
-- configurar um contexto ativo (subscription + App Configuration + app + label + key vault);
-- listar, consultar, criar, atualizar e remover chaves;
-- promover/demover valores entre `plain` e referência de `keyvault`;
-- exportar, planejar e importar configurações em YAML;
-- converter arquivos `.env` e `appsettings.json` para o formato de importação do `azac`.
+`azac` uses Azure CLI (`az`) to:
+- configure an active context (subscription + App Configuration + app + label + key vault);
+- list, inspect, create, update, and delete keys;
+- promote/demote values between `plain` and `keyvault` reference types;
+- export, plan, and import configuration in YAML;
+- convert `.env` and `appsettings.json` files to the `azac` import format.
 
 ---
 
-## How to install / Como instalar
+## How to install
 
-### Pré-requisitos
+### Prerequisites
 
-- Azure CLI instalado (`az`)
-- sessão autenticada: `az login`
-- acesso aos recursos de App Configuration e Key Vault na subscription
+- Azure CLI installed (`az`)
+- authenticated session: `az login`
+- access to App Configuration and Key Vault resources in your subscription
 
-### Opção 1: instalar via Cargo (crates.io)
+### Option 1: install via Cargo (crates.io)
 
 ```bash
 cargo install azac
 ```
 
-### Opção 2: instalar a partir do código-fonte
+### Option 2: install from source
 
 ```bash
 git clone https://github.com/kauanmodolo/azac.git
@@ -35,30 +35,30 @@ cd azac
 cargo install --path .
 ```
 
-### Opção 3: baixar binário de release
+### Option 3: download release binary
 
-Baixe o binário em **GitHub Releases** e adicione ao seu `PATH`.
+Download the binary from **GitHub Releases** and add it to your `PATH`.
 
 ---
 
-## How to use / Como usar
+## How to use
 
-### 1) Configuração inicial
+### 1) Initial setup
 
 ```bash
 azac setup
 ```
 
-O `setup` abre prompts interativos para escolher:
+`setup` opens interactive prompts to select:
 - App Configuration
-- separador de chave (ex: `:`)
-- Application (prefixo)
+- key separator (for example `:`)
+- Application (prefix)
 - Label
 - Key Vault
 
-> Dica: `azac sync` atualiza o cache local de metadados do Azure usado durante o setup.
+> Tip: `azac sync` refreshes local Azure metadata cache used during setup.
 
-### 2) Comandos principais
+### 2) Main commands
 
 ```bash
 azac list
@@ -71,7 +71,7 @@ azac promote <KEY>
 azac demote <KEY>
 ```
 
-### 3) Exportar, planejar e importar
+### 3) Export, plan, and import
 
 ```bash
 azac export config.yaml
@@ -79,27 +79,27 @@ azac plan config.yaml
 azac import config.yaml
 ```
 
-Formato YAML aceito no import:
+Accepted YAML format for import:
 
 ```yaml
 MY_KEY:
   type: plain
-  value: valor
+  value: value
 DB_PASSWORD:
   type: keyvault
-  value: segredo
+  value: secret
 OPTIONAL_KEY:
   type: prompt
-  value: escolha-no-import
+  value: choose-during-import
 ```
 
-Também aceita forma curta:
+Short form is also accepted:
 
 ```yaml
-MY_KEY: valor
+MY_KEY: value
 ```
 
-### 4) Conversão de arquivos para o formato `azac`
+### 4) Convert files to `azac` format
 
 ```bash
 azac convert env .env > config.yaml
@@ -108,18 +108,18 @@ azac convert dotnet appsettings.json > config.yaml
 
 ---
 
-## Referência rápida de comandos
+## Quick command reference
 
-- `azac setup` — configura contexto ativo
-- `azac sync` — atualiza cache de subscriptions/appconfigs/keyvaults
-- `azac list` / `azac ls` — lista chaves do contexto atual
-- `azac show <KEY>` — exibe uma chave
-- `azac set <KEY> <VALUE> [--keyvault]` — define valor
-- `azac delete <KEYS>...` — remove chaves
-- `azac promote <KEY>` — converte `plain` para `keyvault`
-- `azac demote <KEY>` — converte `keyvault` para `plain`
-- `azac export <FILE>` — exporta YAML
-- `azac plan <FILE>` — compara estado atual vs arquivo
-- `azac import <FILE>` — aplica YAML
-- `azac convert env <FILE>` — converte `.env`
-- `azac convert dotnet <FILE>` — converte `appsettings.json`
+- `azac setup` — configure active context
+- `azac sync` — refresh subscriptions/appconfigs/keyvaults cache
+- `azac list` / `azac ls` — list keys in current context
+- `azac show <KEY>` — show one key
+- `azac set <KEY> <VALUE> [--keyvault]` — set value
+- `azac delete <KEYS>...` — delete keys
+- `azac promote <KEY>` — convert `plain` to `keyvault`
+- `azac demote <KEY>` — convert `keyvault` to `plain`
+- `azac export <FILE>` — export YAML
+- `azac plan <FILE>` — compare current state vs file
+- `azac import <FILE>` — apply YAML
+- `azac convert env <FILE>` — convert `.env`
+- `azac convert dotnet <FILE>` — convert `appsettings.json`
