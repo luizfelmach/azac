@@ -30,7 +30,7 @@ cargo install azac
 ### Option 2: install from source
 
 ```bash
-git clone https://github.com/kauanmodolo/azac.git
+git clone https://github.com/luizfelmach/azac.git
 cd azac
 cargo install --path .
 ```
